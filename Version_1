@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Gorenje: расширенная проверка сравнения (v1.5.0)
 // @namespace    https://gorenje-ru.ru/
-// @version      1.5.0
+// @version      1.5.2
 // @description  Сверка Gorenje с официальным сайтом.
 // @match        https://gorenje-ru.ru/compare/*
 // @match        https://gorenje-ru.ru/catalog/*.html
@@ -53,7 +53,7 @@
   const FIELD_MAPPING_RAW = {
     "Тип": [],
     "Тип плиты": [/^(?:категория|тип прибора)$/],
-    "Тип варочной поверхности": [/^тип варочной поверхности/],
+    "Тип варочной поверхности": [/^тип варочной поверхности/, /решетк/],
     "Тип духового шкафа": [/^тип духового шкафа/, /^тип духовки/],
     "Способ подключения": [/^тип питания/, /^источник энергии/, /^способ подключения/],
     "Объем рабочей камеры, л": [/^полезный объем/],
@@ -343,6 +343,25 @@
     if (/^(?:нет|no|-|false|отсутствует)$/.test(key) || key === "0") return "no";
     return "";
   }
+
+  // На официальном сайте поле «Тип варочной поверхности» у части моделей описывает
+  // не материал поверхности, а вид энергии (газ/электро/индукция) — это дублирует
+  // общий тип прибора и не годится как источник для сравнения материала.
+  function isEnergyTypeWord(value) {
+    const key = normalize(value);
+    return /^(?:газов(?:ая|ый|ое|ых)?|электрическ[а-я]*|индукционн[а-я]*|комбинированн[а-я]*)$/.test(key);
+  }
+  function surfaceMaterial(value) {
+  const k = normalize(value);
+  if (/чугун/.test(k)) return "чугун";
+  if (/стеклокерам/.test(k)) return "стеклокерамика";
+  if (/нержавеющ|сталь/.test(k)) return "сталь";
+  if (/эмаль/.test(k)) return "эмаль";
+  if (/алюмин/.test(k)) return "алюминий";
+  if (/стекло/.test(k)) return "стекло";
+  if (/керамик/.test(k)) return "керамика";
+  return "";
+}
 
   function unitInfo(value) {
     const key = normalize(value);
@@ -1296,6 +1315,59 @@
   function findReference(localTitle, localValue, official) {
     const zoneKey = normalizeLabel(localTitle);
     const entries = official.entries || [];
+    // «Тип варочной поверхности»: у газовых плит материал описывается полем
+    // «Решетки» (значение «Чугунные решетки»), а поле «Тип варочной
+    // поверхности» дублирует вид энергии (газ/электро). Приоритет —
+    // «Решетки», при их отсутствии — «Тип варочной поверхности». Ветка
+    // стоит до канонического поиска, чтобы не отдать строку полю «Газовая».
+if (/^тип варочной поверхности/.test(normalizeLabel(localTitle))) {
+  const localMat = surfaceMaterial(localValue);
+  const localIsEnergyWord = isEnergyTypeWord(localValue);
+
+  // Кандидаты: «Решетки», «Материал варочной поверхности», «Тип варочной поверхности»
+  const grateCandidates = localIsEnergyWord
+    ? []
+    : entries.filter((e) => /решетк/.test(normalizeLabel(e.label)) && !isNegative(e.value));
+  const materialCandidates = localIsEnergyWord
+    ? []
+    : entries.filter((e) => /^(?:материал|покрытие)\s+варочной/.test(normalizeLabel(e.label)));
+  const surfaceCandidates = entries.filter((e) =>
+    /^тип варочной поверхности/.test(normalizeLabel(e.label))
+    && (localIsEnergyWord || !isEnergyTypeWord(e.value))
+  );
+
+  // 1) Если локальное значение — явный материал (чугунный, стеклокерамика и т.д.),
+  //    ищем кандидата с тем же материалом в приоритете: Решётки → Материал → Тип.
+  if (localMat) {
+    for (const list of [grateCandidates, materialCandidates, surfaceCandidates]) {
+      const match = list.find((e) => surfaceMaterial(e.value) === localMat);
+      if (match) {
+        console.log(`[GCV] Тип варочной поверхности: материал «${localMat}» → «${match.label}» = «${match.value}»`);
+        return { entry: match, localMeta: null, kind: "surface-material" };
+      }
+    }
+  }
+
+  // 2) Локальное значение — энергетическое слово («газовая», «электрическая»):
+  //    сравниваем только с полем «Тип варочной поверхности».
+  if (localIsEnergyWord) {
+    const match = surfaceCandidates.find((e) => compareWithEntry(localValue, localTitle, e, null) === true);
+    if (match) return { entry: match, localMeta: null, kind: "spec" };
+  }
+
+  // 3) Общий случай: берём первого кандидата, прошедшего стандартное сравнение.
+  const matched = (list) => list.filter((e) => compareWithEntry(localValue, localTitle, e, null) === true);
+  const preferred = matched(grateCandidates).length ? matched(grateCandidates)
+    : matched(materialCandidates).length ? matched(materialCandidates)
+    : matched(surfaceCandidates);
+  if (preferred.length) {
+    preferred.sort((a, b) => Number(b.group === "summary") - Number(a.group === "summary"));
+    console.log(`[GCV] Тип варочной поверхности: взято «${preferred[0].label}» = «${preferred[0].value}»`);
+    return { entry: preferred[0], localMeta: null, kind: "spec" };
+  }
+  console.warn("[GCV] Тип варочной поверхности: ни одно поле не дало совпадения");
+}
+
     if (zoneKey === "размеры" && parseDimensionParts(localValue).length !== 3) return null;
     const zoneSide = /^(передняя|задняя)(?:\s|,)/.exec(zoneKey)?.[1];
     if (zoneSide && !/левая|правая/.test(zoneKey) && numbersOf(localValue).length >= 2) {
@@ -1336,7 +1408,16 @@
       const canonicalCandidates = entries.filter((entry) =>
         canonicalLabel(entry.label) === localCanonical && isSemanticallyCompatible(localTitle, entry.label)
       );
-      if (canonicalCandidates.length) {
+      // «Тип варочной поверхности» на официальном сайте иногда дублирует вид энергии
+      // (газовая/электрическая) вместо материала поверхности. Если локальное значение
+      // явно про материал (не про вид энергии), такое поле-тёзка не годится — лучше
+      // отдать эту характеристику нечёткому поиску, который найдёт «Решётки» и т.п.
+      const localIsEnergyWord = isEnergyTypeWord(localValue);
+      const materialAwareCandidates = localIsEnergyWord
+        ? canonicalCandidates
+        : canonicalCandidates.filter((entry) => !isEnergyTypeWord(entry.value));
+
+      if (materialAwareCandidates.length) {
         const genericVolumeLabels = new Set([
           "полезный объем",
           "объем нетто",
@@ -1349,17 +1430,19 @@
         const hasCompartmentVolumes = entries.some((entry) =>
           /^объем (?:нетто|брутто) [хм] о/.test(normalizeLabel(entry.label))
         );
-        const hasValueMatch = canonicalCandidates.some((entry) =>
+        const hasValueMatch = materialAwareCandidates.some((entry) =>
           compareWithEntry(localValue, localTitle, entry, localMeta) === true
         );
         if (isGenericVolume && hasCompartmentVolumes && !hasValueMatch) return null;
-        canonicalCandidates.sort((first, second) => {
+        materialAwareCandidates.sort((first, second) => {
           const firstMatch = compareWithEntry(localValue, localTitle, first, localMeta) === true ? 1 : 0;
           const secondMatch = compareWithEntry(localValue, localTitle, second, localMeta) === true ? 1 : 0;
           return secondMatch - firstMatch || Number(second.group === "summary") - Number(first.group === "summary");
         });
-        return { entry: canonicalCandidates[0], localMeta, kind: "alias" };
+        return { entry: materialAwareCandidates[0], localMeta, kind: "alias" };
       }
+      // Иначе (canonicalCandidates непусты, но все — «энергетические» тёзки) —
+      // проваливаемся ниже, к обычному поиску по FIELD_MAPPING/нечёткому сравнению.
     }
 
     const descriptor = labelDescriptor(localTitle, localValue);
@@ -1439,6 +1522,12 @@
   }
 
   function compareReference(localValue, localTitle, reference) {
+	  if (reference.kind === "surface-material") {
+  const a = surfaceMaterial(localValue);
+  const b = surfaceMaterial(reference.entry.value);
+  if (!a || !b) return null;
+  return a === b;
+}
     if (reference.kind === "zone") {
       const localNumbers = numbersOf(localValue);
       const diameter = numberOf(reference.entry.diameter.value);
@@ -1780,7 +1869,7 @@
     document.head.appendChild(style);
     panel = document.createElement("section");
     panel.id = PANEL_ID;
-     panel.innerHTML = `<div class="gcv-head"><span class="gcv-title">Расширенная проверка v1.5.0</span><button data-action="toggle">Скрыть</button></div> <div class="gcv-body"><button class="gcv-run" data-action="run">Проверить ещё раз</button><div class="gcv-output">Таблица загружается…</div></div>`;
+     panel.innerHTML = `<div class="gcv-head"><span class="gcv-title">Расширенная проверка v1.5.2</span><button data-action="toggle">Скрыть</button></div> <div class="gcv-body"><button class="gcv-run" data-action="run">Проверить ещё раз</button><div class="gcv-output">Таблица загружается…</div></div>`;
     panel.querySelector('[data-action="run"]').addEventListener("click", () => runChecks());
     panel.querySelector('[data-action="toggle"]').addEventListener("click", (event) => {
       panel.classList.toggle("gcv-collapsed");
