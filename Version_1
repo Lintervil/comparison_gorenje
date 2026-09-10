@@ -1,23 +1,18 @@
 // ==UserScript==
-// @name         Gorenje: расширенная проверка сравнения (v1.3.0)
+// @name         Gorenje: расширенная проверка сравнения (v1.5.0)
 // @namespace    https://gorenje-ru.ru/
-// @version      1.4.0
-// @description  Сверка Gorenje с официальным сайтом, PDF и резервным веб-поиском по сниппетам.
-// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js
+// @version      1.5.0
+// @description  Сверка Gorenje с официальным сайтом.
 // @match        https://gorenje-ru.ru/compare/*
 // @match        https://gorenje-ru.ru/catalog/*.html
 // @match        https://gorenje-ru.ru/catalog/*/*.html
 // @match        https://gorenje-ru.ru/catalog/*/*/*.html
 // @match        https://gorenje-ru.ru/catalog/*/*/*/*.html
-// @match        https://gorenje-ru.ru/bitrix/admin/iblock_element_edit.php*
 // @match        https://ru.gorenje.com/products/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      ru.gorenje.com
 // @connect      gorenje-ru.ru
-// @connect      html.duckduckgo.com
-// @connect      www.bing.com
-// @connect      bing.com
 // ==/UserScript==
 
 (function () {
@@ -231,119 +226,6 @@
     { key: "temperature-range", patterns: [/^(?:диапазон температур|температурные режимы)$/] },
   ];
 
-  const MANUAL_COMMON_FIELDS = [
-    { label: "Габаритные размеры ВхШхГ, см", patterns: [/габаритн(?:ые|ых)?\s+размер/i, /размер(?:ы)?\s*\(?\s*[вw]\s*[xх×]\s*[шw]\s*[xх×]\s*г/i] },
-    { label: "Размеры в упаковке ВхШхГ, см", patterns: [/размер(?:ы)?\s+в\s+упаковке/i, /упаковк.*размер/i] },
-    { label: "Размеры ниши для встраивания (ВхШхГ), см", patterns: [/размер(?:ы)?\s+(?:ниши|для\s+встраивания)/i, /монтажн(?:ые|ых)\s+размер/i] },
-  ];
-
-  const CATEGORY_PROFILES = [
-    {
-      key: "refrigerator", label: "Холодильники", pattern: /холодиль|морозиль|kholodil|morozil|refrigerator|freezer/i,
-      fields: [
-        { label: "Объем холодильного отделения, л", patterns: [/объем.*холодильн.*отделен/i, /полезн.*объем.*холодильн/i] },
-        { label: "Объем морозильного отделения, л", patterns: [/объем.*морозильн.*отделен/i, /полезн.*объем.*морозильн/i] },
-        { label: "Общий объем, л", patterns: [/общ(?:ий|его)\s+объем/i] },
-        { label: "Мощность замораживания, кг/24ч", patterns: [/мощност.*замораж/i] },
-        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
-        { label: "Уровень шума, дБ", patterns: [/уровень\s+шума/i] },
-        { label: "Количество температурных зон", patterns: [/количество\s+температурн.*зон/i] },
-        { label: "Диапазон температур", patterns: [/диапазон\s+температур/i] },
-      ],
-    },
-    {
-      key: "washing", label: "Стиральные машины", pattern: /стиральн|washing|washer|stiral/i,
-      fields: [
-        { label: "Максимальная загрузка (хлопок), кг", patterns: [/максимальн.*загруз|загрузк.*хлопок/i] },
-        { label: "Максимальное количество оборотов отжима, об./мин.", patterns: [/оборот.*отжим|скорост.*отжим/i] },
-        { label: "Расход воды за цикл, л", patterns: [/расход\s+воды.*цикл/i] },
-        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
-        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
-        { label: "Количество программ", patterns: [/количество\s+программ/i] },
-        { label: "Мотор", patterns: [/инверторн.*мотор|тип\s+двигател/i] },
-        { label: "Сенсор влажности белья", patterns: [/сенсор.*влажност/i] },
-      ],
-    },
-    {
-      key: "dryer", label: "Сушильные машины", pattern: /сушильн|dryer|sushil/i,
-      fields: [
-        { label: "Максимальная загрузка (хлопок), кг", patterns: [/максимальн.*загруз|загрузк.*хлопок/i] },
-        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
-        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
-        { label: "Количество программ", patterns: [/количество\s+программ/i] },
-        { label: "Тепловой насос", patterns: [/теплов.*насос/i] },
-        { label: "Расход электроэнергии", patterns: [/расход.*электроэнерг|энергопотреблен/i] },
-      ],
-    },
-    {
-      key: "dishwasher", label: "Посудомоечные машины", pattern: /посудомоеч|dishwasher|posudomoech/i,
-      fields: [
-        { label: "Вместимость комплектов посуды", patterns: [/вместимость.*комплект|комплект.*посуд/i] },
-        { label: "Расход воды за цикл, л", patterns: [/расход\s+воды.*цикл/i] },
-        { label: "Количество программ", patterns: [/количество\s+программ/i] },
-        { label: "Тип сушки", patterns: [/тип\s+сушки|сушка/i] },
-        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
-        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
-        { label: "Полная защита от протечек", patterns: [/защит.*протеч|aquastop|аквастоп/i] },
-      ],
-    },
-    {
-      key: "microwave", label: "Микроволновые печи", pattern: /микроволнов|microwave|mikrovoln/i,
-      fields: [
-        { label: "Объем рабочей камеры, л", patterns: [/объем.*камер|вместимость.*камер/i] },
-        { label: "Мощность микроволн", patterns: [/мощность.*микроволн/i] },
-        { label: "Количество уровней мощности", patterns: [/уровн.*мощност/i] },
-        { label: "Диаметр тарелки", patterns: [/диаметр.*тарелк|поворотн.*стол/i] },
-        { label: "Гриль", patterns: [/мощность.*грил|наличие.*грил|гриль/i] },
-      ],
-    },
-    {
-      key: "oven", label: "Духовые шкафы", pattern: /духов|oven|духовк/i,
-      fields: [
-        { label: "Объем духовки, л", patterns: [/объем.*духов|объем.*рабоч.*камер/i] },
-        { label: "Количество функций духовки", patterns: [/количество.*функц|количество.*программ/i] },
-        { label: "Тип очистки", patterns: [/тип\s+очистк|очистк.*камер/i] },
-        { label: "Максимальная температура, °С", patterns: [/максимальн.*температур/i] },
-        { label: "Присоединительная мощность, кВт", patterns: [/присоединительн.*мощност|мощность.*подключ/i] },
-        { label: "Гриль", patterns: [/гриль/i] },
-        { label: "Очистка паром", patterns: [/очистк.*пар|steam/i] },
-      ],
-    },
-    {
-      key: "hob", label: "Варочные панели и плиты", pattern: /плит|варочн|cooktop|hob|plity|varochn/i,
-      fields: [
-        { label: "Количество конфорок", patterns: [/количество\s+конфорок|число\s+конфорок/i] },
-        { label: "Тип варочной поверхности", patterns: [/тип\s+варочн.*поверхност/i] },
-        { label: "Тип управления", patterns: [/тип\s+управлен|управление/i] },
-        { label: "Присоединительная мощность, кВт", patterns: [/присоединительн.*мощност|мощность.*подключ/i] },
-        { label: "Диаметр конфорок", patterns: [/диаметр.*конфор|размер.*конфор/i] },
-        { label: "Электроподжиг", patterns: [/электроподжиг/i] },
-        { label: "Газ-контроль", patterns: [/газ-контрол/i] },
-      ],
-    },
-    {
-      key: "wine", label: "Винные шкафы", pattern: /винн|wine/i,
-      fields: [
-        { label: "Вместимость бутылок по 0,75 л", patterns: [/вместимость.*бутыл|стандартн.*бутыл/i] },
-        { label: "Количество температурных зон", patterns: [/количество.*температурн.*зон/i] },
-        { label: "Диапазон температур", patterns: [/диапазон.*температур/i] },
-        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
-        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
-      ],
-    },
-  ];
-
-  const GENERIC_CATEGORY_PROFILE = { key: "generic", label: "Общая техника", pattern: /.*/, fields: [] };
-
-  function categoryProfile(category) {
-    return CATEGORY_PROFILES.find((profile) => profile.key === category) || GENERIC_CATEGORY_PROFILE;
-  }
-
-  function detectProductCategory(product) {
-    const haystack = `${product?.name || ""} ${product?.href || ""}`;
-    return (CATEGORY_PROFILES.find((profile) => profile.pattern.test(haystack)) || GENERIC_CATEGORY_PROFILE).key;
-  }
-
   function canonicalLabel(label) {
     const key = normalizeLabel(label)
       .replace(/(?:^|\s)(?:см|мм|кг|л|вт|квт|квтч|квт ч|kwh|wh|об\s+мин|°c|градус(?:ов)?|шт)(?=\s|$)/g, " ")
@@ -359,14 +241,11 @@
   let runSequence = 0;
   let autoTimer = null;
   const officialCache = new Map();
-  const manualCache = new Map();
-  const webSearchCache = new Map();
   let currentProductEditBase = "";
 
   function sourceUrl() { return window.location.href; }
   function isProductPage() { return window.location.pathname.includes('/catalog/'); }
   function pageMode() { return isProductPage() ? "product" : "compare"; }
-  function isAdminPage() { return window.location.pathname.includes("/bitrix/admin/iblock_element_edit.php"); }
 
   function textOf(element) {
     if (!element) return "";
@@ -743,7 +622,6 @@
         const name = h1 ? h1.textContent.trim() : document.title;
         const articleRow = findRow(rows, /^артикул/);
         const product = { name, href: window.location.href, id: "", article: articleRow?.values[0] || "" };
-        product.category = detectProductCategory(product);
         product.model = modelCandidates(product)[0] || "";
         return [product];
     }
@@ -758,7 +636,6 @@
           id: removeButton?.dataset.id || "",
           article: articleRow?.values[index] || "",
         };
-        product.category = detectProductCategory(product);
         product.model = modelCandidates(product)[0] || "";
         return product;
       });
@@ -876,45 +753,6 @@
       console.warn("[GCV] Не удалось получить ссылку редактирования", product.href, error);
       return "";
     }
-  }
-
-  function findAdminFieldRow(label) {
-    const target = normalizeLabel(formatOfficialValue(label));
-    if (!target) return null;
-    const candidates = [...document.querySelectorAll("tr, .adm-detail-content-item-block, .adm-detail-content-cell-l")];
-    return candidates.find((row) => {
-      const labelElement = row.querySelector(".adm-detail-content-cell-l, label, th, td:first-child");
-      const text = normalizeLabel(formatOfficialValue(labelElement?.textContent || row.textContent));
-      return text === target || text.includes(target) || target.includes(text);
-    }) || null;
-  }
-
-  function highlightAdminRow(label) {
-    const row = findAdminFieldRow(label);
-    if (!row) return false;
-    let style = document.getElementById("gcv-admin-highlight-style");
-    if (!style) {
-      style = document.createElement("style");
-      style.id = "gcv-admin-highlight-style";
-      style.textContent = ".gcv-admin-highlight{background:#fff0bf!important;outline:2px solid #f0a000!important;outline-offset:-2px}.gcv-admin-highlight input,.gcv-admin-highlight textarea,.gcv-admin-highlight select{box-shadow:0 0 0 2px rgba(240,160,0,.35)!important}";
-      document.head.appendChild(style);
-    }
-    document.querySelectorAll(".gcv-admin-highlight").forEach((item) => item.classList.remove("gcv-admin-highlight"));
-    row.classList.add("gcv-admin-highlight");
-    row.scrollIntoView({ behavior: "smooth", block: "center" });
-    return true;
-  }
-
-  function initAdminHighlight() {
-    const requested = new URLSearchParams(window.location.hash.slice(1)).get("gcv");
-    if (!requested) return;
-    const label = requested.trim();
-    if (highlightAdminRow(label)) return;
-    let attempts = 0;
-    const timer = window.setInterval(() => {
-      attempts += 1;
-      if (highlightAdminRow(label) || attempts >= 40) window.clearInterval(timer);
-    }, 500);
   }
 
   function renderProductEditLinks(products) {
@@ -1044,251 +882,6 @@
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return response.text();
     });
-  }
-
-  const WEB_SEARCH_ENGINES = [
-    {
-      name: "DuckDuckGo",
-      buildUrl: (query) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
-      rowSelector: ".result",
-      titleSelector: ".result__a",
-      snippetSelector: ".result__snippet",
-    },
-    {
-      name: "Bing",
-      buildUrl: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=5`,
-      rowSelector: "li.b_algo",
-      titleSelector: "h2 a",
-      snippetSelector: ".b_caption p, .b_paractl",
-    },
-  ];
-
-  function searchText(element) {
-    return String(element?.textContent || "").replace(/\s+/g, " ").trim();
-  }
-
-  function searchResultUrl(href, baseUrl) {
-    try {
-      const url = new URL(href, baseUrl);
-      const redirected = url.searchParams.get("uddg");
-      return redirected ? decodeURIComponent(redirected) : url.href;
-    } catch (_) {
-      return href || "";
-    }
-  }
-
-  function parseWebSearchResults(html, engine) {
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    return [...doc.querySelectorAll(engine.rowSelector)]
-      .map((row) => {
-        const link = row.querySelector(engine.titleSelector);
-        const snippet = row.querySelector(engine.snippetSelector);
-        const title = searchText(link);
-        const text = searchText(snippet);
-        const url = searchResultUrl(link?.getAttribute("href") || "", engine.buildUrl(""));
-        return { title, snippet: text, url };
-      })
-      .filter((item) => {
-        try { return new URL(item.url).hostname !== "gorenje-ru.ru" && !new URL(item.url).hostname.endsWith(".gorenje-ru.ru"); }
-        catch (_) { return true; }
-      })
-      .filter((item) => item.title || item.snippet)
-      .slice(0, 5);
-  }
-
-  async function searchWebSnippets(query) {
-    const key = normalize(query);
-    if (webSearchCache.has(key)) return webSearchCache.get(key);
-
-    const request = (async () => {
-      const failures = [];
-      let lastSearchUrl = "";
-      for (const engine of WEB_SEARCH_ENGINES) {
-        const searchUrl = engine.buildUrl(query);
-        lastSearchUrl = searchUrl;
-        try {
-          const html = await requestHtml(searchUrl);
-          const results = parseWebSearchResults(html, engine);
-          if (results.length) return { query, engine: engine.name, searchUrl, results };
-          failures.push(`${engine.name}: пустая выдача`);
-        } catch (error) {
-          failures.push(`${engine.name}: ${String(error.message || error)}`);
-        }
-      }
-      return { query, engine: "", searchUrl: lastSearchUrl, results: [], error: failures.join("; ") };
-    })();
-
-    webSearchCache.set(key, request);
-    return request;
-  }
-
-  function webValueWords(value) {
-    const ignored = new Set(["да", "нет", "есть", "шт", "см", "мм", "кг", "л", "вт", "квт", "квтч", "м", "г"]);
-    return normalize(value)
-      .replace(/\d+(?:\.\d+)?/g, " ")
-      .replace(/[^a-zа-яё]+/g, " ")
-      .split(/\s+/)
-      .filter((word) => word.length >= 3 && !ignored.has(word));
-  }
-
-  function webEvidenceMatches(localValue, localTitle, result) {
-    const haystack = normalize(result.snippet);
-    const localNumbers = numbersOf(localValue);
-    const webNumbers = numbersOf(haystack);
-    const isDimension = /(?:размер|габарит|высот|ширин|глубин|ниши|упаковк)/.test(normalizeLabel(localTitle));
-    const numbersMatch = localNumbers.every((number) => webNumbers.some((candidate) =>
-      Math.abs(number - candidate) < 0.01
-      || (isDimension && (Math.abs(number * 10 - candidate) < 0.1 || Math.abs(number - candidate * 10) < 0.1))
-    ));
-    if (localNumbers.length && !numbersMatch) return false;
-
-    const words = webValueWords(localValue);
-    if (!words.length) return localNumbers.length > 0;
-    const wordHits = words.filter((word) => haystack.includes(word)).length;
-    return wordHits >= Math.max(1, Math.ceil(words.length / 2));
-  }
-
-  function webSnippetLabel(result) {
-    const text = [result?.title, result?.snippet].filter(Boolean).join(": ") || "Текстового сниппета нет";
-    return text.length > 900 ? `${text.slice(0, 897)}…` : text;
-  }
-
-  function webEvidenceLabel(evidence) {
-    const snippet = webSnippetLabel(evidence.result);
-    return evidence.error && !evidence.result ? `${snippet}; ${evidence.error}` : snippet;
-  }
-
-  async function findWebEvidence(product, localTitle, localValue) {
-    const model = product?.model || modelCandidates(product)[0] || "";
-    if (!model) return { available: false, reason: "модель товара не определена" };
-
-    const query = `Gorenje ${model} ${String(localTitle || "").trim()} -site:gorenje-ru.ru`.trim();
-    const search = await searchWebSnippets(query);
-    const matched = search.results.find((result) => webEvidenceMatches(localValue, localTitle, result)) || null;
-    return {
-      available: true,
-      matched: Boolean(matched),
-      query,
-      engine: search.engine,
-      searchUrl: search.searchUrl,
-      result: matched || search.results.find((item) => item.snippet || item.title) || null,
-      error: search.error || "",
-    };
-  }
-
-  function requestBinary(url) {
-    const gmRequest = typeof GM_xmlhttpRequest === "function"
-      ? GM_xmlhttpRequest
-      : (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function" ? GM.xmlHttpRequest : null);
-    if (gmRequest) {
-      return new Promise((resolve, reject) => {
-        gmRequest({
-          method: "GET", url, timeout: 45000, responseType: "arraybuffer",
-          onload: (response) => {
-            if (response.status >= 200 && response.status < 400 && response.response) resolve(response.response);
-            else reject(new Error(`HTTP ${response.status}`));
-          },
-          ontimeout: () => reject(new Error("тайм-аут загрузки PDF")),
-          onerror: () => reject(new Error("ошибка загрузки PDF")),
-        });
-      });
-    }
-    return fetch(url, { credentials: "omit" }).then((response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return response.arrayBuffer();
-    });
-  }
-
-  async function extractPdfText(buffer) {
-    const pdfjs = globalThis.pdfjsLib || (typeof unsafeWindow !== "undefined" ? unsafeWindow.pdfjsLib : null);
-    if (!pdfjs?.getDocument) return "";
-    const documentTask = pdfjs.getDocument({ data: new Uint8Array(buffer), disableWorker: true });
-    const pdf = await documentTask.promise;
-    const pages = [];
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      const page = await pdf.getPage(pageNumber);
-      const content = await page.getTextContent();
-      pages.push(content.items.map((item) => item.str).join("\n"));
-    }
-    return pages.join("\n");
-  }
-
-  function manualLines(text) {
-    return String(text ?? "")
-      .replace(/\u00a0/g, " ")
-      .split(/\r?\n/)
-      .map((line) => line.replace(/[ \t]+/g, " ").trim())
-      .filter(Boolean);
-  }
-
-  function manualValueAt(lines, index, patterns) {
-    const line = lines[index] || "";
-    let value = line;
-    patterns.some((pattern) => {
-      if (!pattern.test(line)) return false;
-      value = line.replace(pattern, "").replace(/^\s*[:：\-–—]\s*/, "").trim();
-      return true;
-    });
-    const residual = value.replace(/[()[\],:;.\s×xхвшгмс]/gi, "");
-    if (!value || value === line || !residual) value = lines[index + 1] || "";
-    return value.replace(/^\s*[:：\-–—]\s*/, "").replace(/\s+/g, " ").trim();
-  }
-
-  function parseManualEntries(text, url, category) {
-    const lines = manualLines(text);
-    const profile = categoryProfile(category);
-    const fields = [...MANUAL_COMMON_FIELDS, ...profile.fields];
-    const entries = [];
-    const seen = new Set();
-    fields.forEach((field) => {
-      const index = lines.findIndex((line) => field.patterns.some((pattern) => pattern.test(line)));
-      if (index < 0) return;
-      const value = manualValueAt(lines, index, field.patterns);
-      if (!value || value === lines[index] || value.length > 180) return;
-      const entry = {
-        group: `manual-${profile.key}`,
-        label: field.label,
-        value: formatOfficialValue(value, `${lines[index]} ${field.label}`),
-        sourceUrl: url,
-        sourceType: "pdf",
-        categories: [profile.key],
-      };
-      const key = `${entry.label}|${entry.value}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        entries.push(entry);
-      }
-    });
-    return entries;
-  }
-
-  async function loadManualSources(record, product) {
-    const manualUrls = [...new Set(record.manualUrls || [])].slice(0, 4);
-    if (!manualUrls.length) return { ...record, manualUrls: [], manualEntries: [] };
-    const parsed = await Promise.all(manualUrls.map(async (url) => {
-      try {
-        const buffer = await requestBinary(url);
-        const text = await extractPdfText(buffer);
-        return parseManualEntries(text, url, product.category);
-      } catch (error) {
-        console.warn("[GCV] PDF-инструкция не обработана", url, error);
-        return [];
-      }
-    }));
-    const manualEntries = parsed.flat().map((entry) => {
-      const meta = dimensionMeta(entry.label);
-      const parts = parseDimensionParts(entry.value);
-      return meta && parts.length === 3
-        ? { ...entry, ...meta, isDimensionComposite: true }
-        : entry;
-    });
-    return {
-      ...record,
-      manualUrls,
-      manualEntries,
-      entries: [...record.entries, ...manualEntries],
-      category: product.category,
-    };
   }
 
   function foldHomoglyphs(value) {
@@ -1518,12 +1111,6 @@
       ...[...doc.querySelectorAll(".products-detail__advantages-thumbs-item-text")].map(clean),
       ...features.flatMap((item) => [item.subtitle, item.title]),
     ].filter(Boolean))];
-    const manualUrls = [...new Set([...doc.querySelectorAll("a[href], [data-href], [data-url]")]
-      .map((element) => element.href || element.dataset.href || element.dataset.url || "")
-      .map((href) => {
-        try { return new URL(href, url).href; } catch (_) { return ""; }
-      })
-      .filter((href) => /\.pdf(?:$|[?#])/i.test(href)))];
     const official = {
       url,
       title,
@@ -1531,7 +1118,6 @@
       features,
       featureNames,
       featureText: [...featureNames, ...features.map((item) => `${item.subtitle} ${item.title} ${item.text}`)].join(" "),
-      manualUrls,
     };
 
     entries.forEach((entry) => {
@@ -1707,13 +1293,9 @@
     return descriptor;
   }
 
-  function relevantOfficialEntries(official, category) {
-    return (official.entries || []).filter((entry) => !entry.categories?.length || !category || entry.categories.includes(category));
-  }
-
-  function findReference(localTitle, localValue, official, category = "") {
+  function findReference(localTitle, localValue, official) {
     const zoneKey = normalizeLabel(localTitle);
-    const entries = relevantOfficialEntries(official, category);
+    const entries = official.entries || [];
     if (zoneKey === "размеры" && parseDimensionParts(localValue).length !== 3) return null;
     const zoneSide = /^(передняя|задняя)(?:\s|,)/.exec(zoneKey)?.[1];
     if (zoneSide && !/левая|правая/.test(zoneKey) && numbersOf(localValue).length >= 2) {
@@ -1887,10 +1469,7 @@
       if (!officialCache.has(found.url)) {
         officialCache.set(found.url, requestHtml(found.url).then((html) => parseOfficialPage(html, found.url)));
       }
-      const baseRecord = await officialCache.get(found.url);
-      const manualKey = `${found.url}|${product.category || "generic"}`;
-      if (!manualCache.has(manualKey)) manualCache.set(manualKey, loadManualSources(baseRecord, product));
-      const record = await manualCache.get(manualKey);
+      const record = await officialCache.get(found.url);
       return { ...record, model: found.model };
     } catch (error) {
       return { error: String(error.message || error), model: modelCandidates(product)[0] || "" };
@@ -1900,15 +1479,11 @@
   async function runOfficialValidation(rows, products) {
     const result = emptyResult();
     const records = await Promise.all(products.map((product) => loadOfficialProduct(product)));
-    const summary = { records, checked: 0, confirmed: 0, mismatches: 0, unknown: 0, skipped: 0, failed: 0, manualSources: 0, manualFields: 0, categories: [], webSearches: 0, webConfirmed: 0, webWarnings: 0 };
-    const webFallbacks = [];
+    const summary = { records, checked: 0, confirmed: 0, mismatches: 0, unknown: 0, skipped: 0, failed: 0 };
 
     records.forEach((record, index) => {
       if (record.error) summary.failed += 1;
       if (record.url) products[index].officialUrl = record.url;
-      summary.manualSources += record.manualUrls?.length || 0;
-      summary.manualFields += record.manualEntries?.length || 0;
-      if (record.category) summary.categories.push(record.category);
     });
 
     rows.forEach((row) => {
@@ -1932,46 +1507,16 @@
           });
           return;
         }
-        const reference = findReference(row.title, localValue, record, products[index]?.category || record.category);
+        const reference = findReference(row.title, localValue, record);
         if (!reference) {
           summary.unknown += 1;
-          webFallbacks.push(findWebEvidence(products[index], row.title, localValue).then((evidence) => {
-            if (!evidence.available) {
-              const message = `⚠️ ОФИЦИАЛЬНЫЙ ИСТОЧНИК: характеристика «${row.title}» не найдена у ${productLabel(products, index)}`;
-              noteResult(result, row, index, "warning", message, "Нет на оф. сайте", record.url, true, {
-                label: row.title,
-                value: `Поле не найдено на официальном сайте; веб-поиск пропущен: ${evidence.reason}`,
-                source: record.url,
-                anchorLabel: row.title,
-              });
-              return;
-            }
-
-            summary.webSearches += 1;
-            const status = evidence.matched ? "ok" : "warning";
-            if (evidence.matched) summary.webConfirmed += 1;
-            else summary.webWarnings += 1;
-            const prefix = evidence.matched ? "✅" : "⚠️";
-            const engine = evidence.engine || "DuckDuckGo/Bing";
-            const snippet = webEvidenceLabel(evidence);
-            const source = evidence.result?.url || evidence.searchUrl || "";
-            const matchText = evidence.matched ? "локальное значение найдено в сниппете" : "локальное значение не найдено в сниппетах";
-            const message = `${prefix} ВЕБ-ПОИСК (${engine}): ${matchText} для «${row.title}» у ${productLabel(products, index)}; локально «${localValue || "пусто"}»`;
-            noteResult(result, row, index, status, message, `Сниппет: ${snippet}`, source, true, {
-              label: `Веб-поиск: ${row.title}`,
-              value: `${snippet}${evidence.query ? `\nЗапрос: ${evidence.query}` : ""}`,
-              source,
-              anchorLabel: "",
-            });
-          }).catch((error) => {
-            summary.webSearches += 1;
-            summary.webWarnings += 1;
-            const message = `⚠️ ВЕБ-ПОИСК: не удалось проверить «${row.title}» у ${productLabel(products, index)}`;
-            noteResult(result, row, index, "warning", message, String(error.message || error), "", true, {
-              label: `Веб-поиск: ${row.title}`,
-              value: `Ошибка поиска: ${String(error.message || error)}`,
-            });
-          }));
+          const message = `⚠️ ОФИЦИАЛЬНЫЙ ИСТОЧНИК: характеристика «${row.title}» не найдена у ${productLabel(products, index)}`;
+          noteResult(result, row, index, "warning", message, "Нет на оф. сайте", record.url, true, {
+            label: row.title,
+            value: "Поле не найдено на официальном сайте",
+            source: record.url,
+            anchorLabel: row.title,
+          });
           return;
         }
         const comparison = compareReference(localValue, row.title, reference);
@@ -1982,9 +1527,8 @@
 
         const prefix = status === "ok" ? "✅" : status === "error" ? "❌" : "⚠️";
         const fuzzyMark = reference.kind === "fuzzy" ? " [FUZZY]" : "";
-        const pdfMark = reference.entry.sourceType === "pdf" ? " [PDF]" : "";
         const shownLabel = displayDimensionLabel(reference.entry.label);
-        const message = `${prefix} ОФИЦИАЛЬНЫЙ ИСТОЧНИК${pdfMark}${fuzzyMark}: «${row.title}» → «${shownLabel}» у ${productLabel(products, index)}; локально «${localValue || "пусто"}», официально «${reference.entry.value || "пусто"}»`;
+        const message = `${prefix} ОФИЦИАЛЬНЫЙ ИСТОЧНИК${fuzzyMark}: «${row.title}» → «${shownLabel}» у ${productLabel(products, index)}; локально «${localValue || "пусто"}», официально «${reference.entry.value || "пусто"}»`;
         const tooltip = status === "error" ? `На оф. сайте: ${reference.entry.value}` : (status === "warning" ? "Нет на оф. сайте" : "");
         noteResult(result, row, index, status, message, tooltip, reference.entry.sourceUrl || record.url, true, {
           label: shownLabel,
@@ -1994,8 +1538,6 @@
         });
       });
     });
-
-    await Promise.all(webFallbacks);
 
     records.forEach((record, index) => {
       if (!record || record.error || !record.featureNames?.length) return;
@@ -2238,7 +1780,7 @@
     document.head.appendChild(style);
     panel = document.createElement("section");
     panel.id = PANEL_ID;
-     panel.innerHTML = `<div class="gcv-head"><span class="gcv-title">Расширенная проверка v1.4.0</span><button data-action="toggle">Скрыть</button></div> <div class="gcv-body"><button class="gcv-run" data-action="run">Проверить ещё раз</button><div class="gcv-output">Таблица загружается…</div></div>`;
+     panel.innerHTML = `<div class="gcv-head"><span class="gcv-title">Расширенная проверка v1.5.0</span><button data-action="toggle">Скрыть</button></div> <div class="gcv-body"><button class="gcv-run" data-action="run">Проверить ещё раз</button><div class="gcv-output">Таблица загружается…</div></div>`;
     panel.querySelector('[data-action="run"]').addEventListener("click", () => runChecks());
     panel.querySelector('[data-action="toggle"]').addEventListener("click", (event) => {
       panel.classList.toggle("gcv-collapsed");
@@ -2263,7 +1805,7 @@
     if (loading) {
       const loadingNote = document.createElement("p");
       loadingNote.className = "gcv-note";
-       loadingNote.textContent = "Загружаю официальные карточки ru.gorenje.com; отсутствующие поля проверю через DuckDuckGo/Bing…";
+      loadingNote.textContent = "Загружаю официальные карточки ru.gorenje.com…";
       output.appendChild(loadingNote);
       return;
     }
@@ -2272,10 +1814,7 @@
       const official = document.createElement("p");
       official.className = "gcv-note";
       const item = result.officialSummary;
-       const manualNote = item.manualSources ? ` PDF: ${item.manualSources} источника, извлечено полей ${item.manualFields || 0}.` : "";
-        const categoryNote = [...new Set(item.categories || [])].map((category) => categoryProfile(category).label).join(", ");
-        const webNote = item.webSearches ? ` Веб-поиск: подтверждено ${item.webConfirmed}, без совпадения ${item.webWarnings}.` : "";
-        official.textContent = `Официальная проверка: подтверждено ${item.confirmed}, расхождений ${item.mismatches}, нет подтверждения ${item.unknown}, служебных идентификаторов пропущено ${item.skipped || 0}.${manualNote}${webNote}${categoryNote ? ` Категории: ${categoryNote}.` : ""}`;
+      official.textContent = `Официальная проверка: подтверждено ${item.confirmed}, расхождений ${item.mismatches}, нет подтверждения ${item.unknown}, служебных идентификаторов пропущено ${item.skipped || 0}.`;
       output.appendChild(official);
     }
 
@@ -2362,10 +1901,7 @@
     autoTimer = window.setTimeout(() => runChecks(), 1500);
   }
 
-  if (isAdminPage()) {
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initAdminHighlight, { once: true });
-    else initAdminHighlight();
-  } else if (isOfficialProductPage()) {
+  if (isOfficialProductPage()) {
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", focusOfficialField, { once: true });
     else focusOfficialField();
   } else if (document.readyState === "loading") {
