@@ -1,0 +1,742 @@
+// ==UserScript==
+// @name         Gorenje: расширенная проверка сравнения (v1.4.0)
+// @namespace    https://gorenje-ru.ru/
+// @version      1.4.0
+// @description  Сверка карточек Gorenje с Битрикс-интеграцией и Gemini AI fallback.
+// @match        https://gorenje-ru.ru/compare/*
+// @match        https://gorenje-ru.ru/catalog/*.html
+// @match        https://gorenje-ru.ru/catalog/*/*.html
+// @match        https://gorenje-ru.ru/catalog/*/*/*.html
+// @match        https://gorenje-ru.ru/catalog/*/*/*/*.html
+// @match        https://ru.gorenje.com/products/*
+// @match        https://gorenje-ru.ru/bitrix/admin/iblock_element_edit.php*
+// @run-at       document-idle
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @connect      ru.gorenje.com
+// @connect      gorenje-ru.ru
+// @connect      generativelanguage.googleapis.com
+// ==/UserScript==
+(function () {
+"use strict";
+const ROW_SELECTOR = ".compare-table-block__row.js-compare-row, .characteristics__row";
+const PANEL_ID = "gcv-panel";
+const OFFICIAL_ORIGIN = "https://ru.gorenje.com";
+const STATUS_RANK = { ok: 0, warning: 1, error: 2 };
+const BITRIX_IBLOCK_ID = 1099;
+const GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"];
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+let hasRun = false, hasStarted = false, runInProgress = false, runSequence = 0, autoTimer = null, lastRequestAt = 0;
+const officialCache = new Map(), editUrlCache = new Map(), geminiCache = new Map(), webCache = new Map();
+let openPopover = null, popoverListenersReady = false;
+
+function normalize(v){return String(v??"").normalize("NFKC").replace(/\u00a0/g," ").replace(/[\u200B-\u200D\uFEFF]/g,"").replace(/(\d),(\d)/g,"$1.$2").replace(/×/g,"x").replace(/(\d)\s*[хХ]\s*(?=\d)/g,"$1 x ").replace(/ё/g,"е").toLowerCase().replace(/\s+/g," ").trim();}
+function normalizeLabel(v){return normalize(v).replace(/\s+источник\s*$/,"").replace(/\s*\*+\s*$/,"").replace(/([вшг])х(?=[вшг])/g,"$1 x ").replace(/[()[\],:;.!?—–\-/«»"']/g," ").replace(/\s+/g," ").trim();}
+function sourceUrl(){return window.location.href;}
+function isProductPage(){return window.location.pathname.includes('/catalog/');}
+function pageMode(){return isProductPage()?"product":"compare";}
+function isAdminPage(){return window.location.pathname.includes("/bitrix/admin/iblock_element_edit.php");}
+function isOfficialProductPage(){return window.location.origin===OFFICIAL_ORIGIN&&window.location.pathname.startsWith("/products/");}
+
+const FIELD_MAPPING_RAW={
+"Тип":[],"Тип плиты":[/^(?:категория|тип прибора)$/],"Тип варочной поверхности":[/^тип варочной поверхности/],
+"Тип духового шкафа":[/^тип духового шкафа/,/^тип духовки/],"Способ подключения":[/^тип питания/,/^источник энергии/,/^способ подключения/],
+"Объем рабочей камеры, л":[/^полезный объем/],"Объем духовки, л":[/^полезный объем/],
+"Габаритные размеры (ВxШxГ), см":[/^размеры \(ш×в×г\)/,/^габаритные размеры/],
+"Габаритные размеры ВхШхГ, см":[/^размеры \(ш×в×г\)/,/^габаритные размеры/],
+"Размеры ниши для встраивания (ВxШxГ), см":[/^мин\.\s*размеры ниши/,/ниши для встраивания/,/^размеры ниши/],
+"Размеры в упаковке (ВxШxГ), см":[/^размеры в упаковке/],"Размеры в упаковке ВхШхГ, см":[/^размеры в упаковке/],
+"Высота, см":[/^высота мм$/,/^высота$/],"Ширина, см":[/^ширина мм$/,/^ширина$/],"Глубина, см":[/^глубина мм$/,/^глубина$/],
+"Высота упаковки, см":[/^высота в упаковке/,/^высота упаковки/],"Ширина упаковки, см":[/^ширина в упаковке/,/^ширина упаковки/],
+"Глубина упаковки, см":[/^глубина в упаковке/,/^глубина упаковки/],
+"Материал панели управления":[/^материал панели управления/],
+"Материал варочной поверхности":[/^(?:материал|покрытие) варочной (?:поверхности|панели)$/],
+"Материал крышки варочной поверхности":[/^крышка/],"Материал дверцы":[/^материал дверцы/],
+"Цвет":[/^цвет$/],"Цвет фурнитуры":[/^цвет ручки/],"Цвет ручки дверцы":[/^цвет ручки/],
+"Шарнир дверцы":[/^шарнир дверцы/],"Покрытие против отпечатков пальцев":[/^защита от отпечатков/,/^fingerprint/],
+"Внутреннее покрытие духовки":[/^покрытие стенок рабочей камеры/,/^покрытие камеры/,/^эмаль/,/^пиролитическая/],
+"Освещение духовки":[/^освещение духовки/,/^освещение/],"Внутреннее освещение":[/^освещение духовки/,/^освещение/],
+"Дизайн":[/^дизайн/,/^линейка/,/^серия/],"Управление":[/^тип управления/],"Тип управления":[/^тип управления/],
+"Программатор":[/^программатор/],"Таймер":[/^программатор/,/^таймер/],"Тип переключателей":[],"Форма переключателей":[/^форма переключателей/],
+"Класс энергопотребления":[/^класс энергопотребления/],
+"Присоединительная мощность, кВт":[/^присоединительная мощность/,/^мощность подключения/],
+"Присоединительная мощность — эл., кВт":[/^присоединительная мощность/,/^мощность подключения/],
+"Максимальная температура, °С":[/^максимальная температура/],
+"Энергопотребление (классический нагрев), кВт/ч":[/^потребление электроэнергии/],
+"Потребление электроэнергии вентиляционный нагрев, кВт":[/^потребление электроэнергии/],
+"Вес без упаковки, кг":[/^вес нетто/],"Вес нетто, кг":[/^вес нетто/],"Вес брутто, кг":[/^вес брутто/],
+"Артикул":[/^артикул$/],"Страна-производитель":[/^страна производства/],"Гарантия":[/^гарантия/],
+"Система охлаждения":[/^система охлаждения/,/^динамическая система/,/^no ?frost$/],
+"Термоэлектрический предохранитель":[/^термоэлектрический предохранитель/],
+"Дверца":[/^дверца духовки/,/^дверца/],"Съемный стеклопакет":[/^съемный стеклопакет/,/^внутренняя поверхность дверцы/],
+"Количество стекол":[/^застекление дверцы/,/^количество стекол/],"Количество стекол, шт":[/^застекление дверцы/,/^количество стекол/],
+"Количество теплоотражающих слоев":[/термослой/,/^теплоотражающ/],"Количество теплоотражающих слоев, шт":[/термослой/,/^теплоотражающ/],
+"Решетка":[/^решетка/],"Мелкий противень, шт":[/^мелкий противень/],
+"Глубокий противень":[/^глубокий противень/,/^универсальный противень/],"Глубокий эмалированный противень":[/^глубокий противень/,/^1 глубокий/],
+"Рельефные направляющие":[/^рельефные направляющие/,/^направляющие/],"Тип ящика":[/^ящик плиты/],
+"Часы":[/^часы/],"Будильник":[/^будильник/],"Звуковой сигнал":[/^звуковой сигнал/],"Автопрограммы":[/^автопрограммы/],
+"Тип очистки":[/^очистка/,/^aquaclean/,/^тип очистки/,/^каталитическая/],"Очистка от накипи":[/^очистка от накипи/],
+"Индикация остаточного тепла для каждой конфорки":[/^индикация остаточного тепла/,/^индикатор остаточного тепла/],
+"Количество режимов":[/^количество программ/],"Количество функций духовки":[/^количество программ/],
+"Конфорки":[/^количество конфорок/],
+"Общее число конфорок":[/^(?:общее )?(?:количество|число) конфорок/],
+"Зоны расширения":[/^зон[аы] расширени[яй]/],
+"Конфорок газовых":[/^(?:количество )?конфорок газовых/,/^газовые конфорки/],
+"Конфорок стеклокерамических":[/^(?:количество )?конфорок стеклокерамических/],
+"Конфорок индукционных":[/^(?:количество )?конфорок индукционных/],
+"Передняя левая, кВт":[/^мощность передней левой/],"Передняя правая, кВт":[/^мощность передней правой/],
+"Задняя левая, кВт":[/^мощность задней левой/],"Задняя правая, кВт":[/^мощность задней правой/],
+"Передняя левая, мм":[/^ø\s*передняя левая/],"Передняя правая, мм":[/^ø\s*передняя правая/],
+"Задняя левая, мм":[/^ø\s*задняя левая/],"Задняя правая, мм":[/^ø\s*задняя правая/],
+"Объем, л":[/^объем(?: л)?$/,/^объем нетто(?: л)?$/],"Общий объем, л":[/^общий объем(?: брутто)?(?: л)?$/],
+"Полезный объем":[/^(?:полезный объем|объем нетто)(?: л)?$/],"Объем нетто, л":[/^(?:полезный объем|объем нетто)(?: л)?$/],
+"Объем холодильного отделения, л":[/^объем (?:нетто )?(?:холодильного отделения|х о)(?: л)?$/],
+"Объем морозильного отделения, л":[/^объем (?:нетто )?(?:морозильного отделения|м о)(?: л)?$/],
+"Объем барабана, л":[/^объем барабана(?: л)?$/],
+"Максимальная загрузка (хлопок), кг":[/^(?:максимальная )?загрузка(?: кг)?$/],
+"Максимальное количество оборотов отжима, об./мин.":[/^(?:максимальное количество оборотов отжима|отжим)(?: об мин)?$/],
+"Способ открывания дверцы":[/^(?:способ )?(?:открытие|открывание) дверцы/],
+"Дверца открывается":[/^(?:способ )?(?:открытие|открывание) дверцы/],
+"Открывание дверцы":[/^(?:открытие|открывание) дверцы/],
+"Очистка паром":[/^(?:очистка паром|очистка aquaclean|очистка aqua clean)/],
+"Очистка":[/^очистка/,/^aquaclean/,/^каталитическая/],
+"Система интенсивной циркуляции воздуха (multi flow 360)":[/^(?:циркуляция воздуха|система интенсивной циркуляции воздуха)/],
+"Быстрое замораживание":[/^(?:включатель )?быстрое замораживание/],"Эко":[/^режим эко$/,/^эко$/],
+"Мощность микроволн":[/^мощность микроволн/],"Стеклянная тарелка поворотного стола, мм":[/^диаметр тарелки/],
+"Уровень мощности":[/^(?:уровни мощности|количество уровней мощности)/],
+"Сенсор влажности белья":[/^сенсор влажности белья/],
+"Защита от сминания (anti сrease)":[/^(?:защита от сминания|anticrease)/],
+"Присоединительная мощность, Вт":[/^(?:мощность подключения|присоединительная мощность)/],
+"Потребление электроэнергии":[/^(?:потребление|расход) электроэнергии/],
+"Расход электроэнергии":[/^(?:потребление|расход) электроэнергии/],
+"Количество температурных зон":[/^количество температурных зон/],
+"Вместимость бутылок по 0,75 л":[/^(?:вместимость бутылок|стандартные бутылки)/],
+};
+const FIELD_MAPPING={};
+for(const[k,p]of Object.entries(FIELD_MAPPING_RAW))FIELD_MAPPING[normalizeLabel(k)]=p;
+
+const CANONICAL_LABEL_RULES=[
+{key:"country",patterns:[/^страна (?:производитель|производства|изготовитель)$/]},
+{key:"article",patterns:[/^(?:артикул|код товара)$/]},
+{key:"ean",patterns:[/^(?:ean|еаn)(?: код)?$/]},
+{key:"model",patterns:[/^модель$/]},
+{key:"cooker-type",patterns:[/^тип плиты$/,/^категория$/,/^тип прибора$/]},
+{key:"oven-type",patterns:[/^тип духового шкафа$/,/^тип духовки$/]},
+{key:"connection-power",patterns:[/^(?:присоединительная мощность|мощность подключения)(?: эл)?$/]},
+{key:"net-weight",patterns:[/^(?:вес нетто|масса нетто)$/]},
+{key:"gross-weight",patterns:[/^(?:вес брутто|масса брутто)$/]},
+{key:"usable-volume",patterns:[/^(?:полезный объем|объем нетто|объем рабочей камеры|объем духовки|объем духового шкафа)$/]},
+{key:"total-volume",patterns:[/^(?:общий объем|общий объем брутто)$/]},
+{key:"cooling-net-volume",patterns:[/^полезный объем холодильного отделения$/,/^объем нетто х о$/]},
+{key:"cooling-gross-volume",patterns:[/^объем холодильного отделения$/,/^объем брутто х о$/]},
+{key:"freezer-net-volume",patterns:[/^полезный объем морозильного отделения$/,/^объем нетто м о$/]},
+{key:"freezer-gross-volume",patterns:[/^объем морозильного отделения$/,/^объем брутто м о$/]},
+{key:"control",patterns:[/^(?:тип )?управлени[ея]$/]},
+{key:"door-opening",patterns:[/^(?:способ )?(?:открытие|открывание) дверцы/]},
+{key:"cavity-coating",patterns:[/^(?:внутреннее покрытие духовки|покрытие стенок рабочей камеры|покрытие внутренних стенок духовки и противней)$/]},
+{key:"lighting",patterns:[/^(?:внутреннее )?освещение(?: духовки)?$/]},
+{key:"steam-cleaning",patterns:[/^(?:очистка паром|очистка aquaclean|очистка aqua clean)$/]},
+{key:"defrost",patterns:[/^размораживание(?: холодильного отделения| морозильного отделения)?$/]},
+{key:"quick-freeze",patterns:[/^(?:быстрое замораживание|включатель быстрое замораживание)/]},
+{key:"air-circulation",patterns:[/^(?:циркуляция воздуха|система интенсивной циркуляции воздуха)/]},
+{key:"adapt-tech",patterns:[/^(?:adapttech|адаптивная технология охлаждения adapttech cooling)/]},
+{key:"fresh-zone",patterns:[/^(?:зона свежести|контейнер зоны свежести)/]},
+{key:"glass-shelves",patterns:[/^(?:стеклянные полки|количество стеклянных полок)/]},
+{key:"door-shelves",patterns:[/^(?:дверные полки|количество дверных полок)/]},
+{key:"freezing-capacity",patterns:[/^мощность замораживания/]},
+{key:"steam-feature",patterns:[/^(?:обработка паром|функция пара|парогенератор steam ?tech)/]},
+{key:"motor",patterns:[/^(?:мотор|инверторный мотор)/]},
+{key:"homemade-shape",patterns:[/^(?:с|c)водчатая форма.*home ?made/]},
+{key:"bottle-count",patterns:[/^(?:вместимость бутылок|стандартные бутылки)/]},
+{key:"wooden-shelves",patterns:[/^(?:деревянные полки|деревянные полки в холодильной камере)/]},
+{key:"capacity",patterns:[/^(?:вместимость|вместимость комплектов посуды)/]},
+{key:"delay-start",patterns:[/^(?:отсрочка старта|отсрочка запуска|отсрочка окончания программы|установка окончания стирки)/]},
+{key:"child-lock",patterns:[/^(?:блокировка от детей|блокировка панели управления|блокировка управления от детей)$/]},
+{key:"water-cycle",patterns:[/^(?:расход воды за цикл|расход воды)$/]},
+{key:"water-year",patterns:[/^(?:расход воды за год|годовое потребление воды)$/]},
+{key:"energy-year",patterns:[/^(?:расход электроэнергии за год|расход электроэнергии в год|ориентировочное годовое потребление электроэнергии)$/]},
+{key:"noise-wash",patterns:[/^уровень шума (?:при|во время) стирк/]},
+{key:"noise-spin",patterns:[/^уровень шума (?:при|во время) отжима/]},
+{key:"dishwasher-drying",patterns:[/^(?:тип сушки|сушка)/]},
+{key:"height-adjustment",patterns:[/^регулировка высоты/]},
+{key:"aqua-stop",patterns:[/^(?:полная защита от протечек|total aquastop)/]},
+{key:"microwave-power",patterns:[/^мощность микроволн$/]},
+{key:"plate-diameter",patterns:[/^(?:диаметр тарелки|стеклянная тарелка поворотного стола)$/]},
+{key:"energy-class",patterns:[/^класс энергопотребления$/]},
+{key:"load",patterns:[/^(?:максимальная )?загрузка(?: хлопок)?$/]},
+{key:"spin-speed",patterns:[/^(?:максимальное количество оборотов отжима|отжим)$/]},
+{key:"noise",patterns:[/^уровень шума$/]},
+{key:"temperature-range",patterns:[/^(?:диапазон температур|температурные режимы)$/]},
+];
+function canonicalLabel(label){
+const key=normalizeLabel(label).replace(/(?:^|\s)(?:см|мм|кг|л|вт|квт|квтч|квт ч|kwh|wh|об\s+мин|°c|градус(?:ов)?|шт)(?=\s|$)/g," ").replace(/\s+/g," ").trim();
+const rule=CANONICAL_LABEL_RULES.find(i=>i.patterns.some(p=>p.test(key)));
+return rule?rule.key:key;
+}
+
+function textOf(e){if(!e)return"";const c=e.cloneNode(true);c.querySelectorAll(".glossary-tooltip,.gcv-badge,.gcv-source,.gcv-cell-source,.gcv-info-button,.gcv-edit-card").forEach(i=>i.remove());const u=c.querySelector('ul');if(u)return Array.from(u.querySelectorAll('li')).map(l=>l.textContent.trim()).join(', ');return String(c.innerText||c.textContent||"").replace(/\s+/g," ").trim();}
+function officialAnchorUrl(s,l){if(!s||!l)return s||"";try{const u=new URL(s);u.hash=`gcv-field=${encodeURIComponent(l)}`;return u.href;}catch(_){return s;}}
+function focusOfficialField(){
+const req=new URLSearchParams(window.location.hash.slice(1)).get("gcv-field");
+if(!req)return;
+const target=normalizeLabel(req.replace(/^функция\s*:\s*/i,""));
+const hl=()=>{
+const names=document.querySelectorAll([".products-detail__main-props-list-item-name",".products-detail__tech-groups-list-item-name",".products-detail__advantages-thumbs-item-text",".products-detail__advantages-title"].join(","));
+const m=[...names].filter(el=>{const n=normalizeLabel(textOf(el));return n===target||n.includes(target)||target.includes(n);}).map(el=>el.closest(".products-detail__main-props-list-item,.products-detail__tech-groups-list-item,.products-detail__advantages-thumbs-item,.products-detail__advantages-item")||el);
+if(!m.length)return false;
+let st=document.getElementById("gcv-anchor-style");
+if(!st){st=document.createElement("style");st.id="gcv-anchor-style";st.textContent=".gcv-anchor-highlight{outline:3px solid #e33434!important;outline-offset:3px;background:rgba(255,72,72,.16)!important;box-shadow:0 0 0 6px rgba(255,72,72,.12)!important;transition:background .2s ease}";document.head.appendChild(st);}
+m.forEach(el=>el.classList.add("gcv-anchor-highlight"));m[0].scrollIntoView({behavior:"smooth",block:"center"});
+window.setTimeout(()=>m.forEach(el=>el.classList.remove("gcv-anchor-highlight")),7000);return true;
+};
+if(hl())return;let a=0;const t=window.setInterval(()=>{a+=1;if(hl()||a>=40)window.clearInterval(t);},500);
+}
+
+function numbersOf(v){return(normalize(v).match(/\d+(?:\.\d+)?/g)||[]).map(Number);}
+function numberOf(v){const n=numbersOf(v);return n.length?n[0]:null;}
+function isMissing(v){const k=normalize(v).replace(/[\u2020*]+/g,"").trim();return!k||/^(?:не указано|неизвестно|[-—–])$/.test(k);}
+function isNegative(v){const k=normalize(v);return/^(?:нет|no|[-—–]|false|отсутствует)$/.test(k)||k==="0";}
+function isPositive(v){const k=normalize(v);return/^(?:да|есть|\+|yes|true|имеется|присутствует)$/.test(k)||k==="1";}
+function booleanKey(v){const k=normalize(v);if(/^(?:да|есть|\+|yes|true|имеется|присутствует)$/.test(k)||k==="1")return"yes";if(/^(?:нет|no|-|false|отсутствует)$/.test(k)||k==="0")return"no";return"";}
+function unitInfo(v){
+const k=normalize(v);
+if(/(?:^|[\s,(])(?:квтч|квт\/ч|kwh)(?:$|[\s,.)])/.test(k))return{group:"energy",factor:1,name:"кВт·ч"};
+if(/(?:^|[\s,(])квт(?:$|[\s,.)])/.test(k))return{group:"power",factor:1000,name:"кВт"};
+if(/(?:^|[\s,(])вт(?:$|[\s,.)])/.test(k))return{group:"power",factor:1,name:"Вт"};
+if(/(?:^|[\s,(])мм(?:$|[\s,.)])/.test(k))return{group:"length",factor:1,name:"мм"};
+if(/(?:^|[\s,(])см(?:$|[\s,.)])/.test(k))return{group:"length",factor:10,name:"см"};
+if(/(?:^|[\s,(])кг(?:$|[\s,.)])/.test(k))return{group:"weight",factor:1,name:"кг"};
+if(/(?:^|[\s,(])л(?:$|[\s,.)])/.test(k))return{group:"volume",factor:1,name:"л"};
+if(/(?:°c|градус)/.test(k))return{group:"temperature",factor:1,name:"°C"};
+if(/(?:об\s*\/\s*мин|об\s+мин)/.test(k))return{group:"speed",factor:1,name:"об/мин"};
+return null;
+}
+function unitsForLabel(l,v){return unitInfo(l)||unitInfo(v)||{group:"number",factor:1,name:""};}
+function valuesEqual(f,s){
+const lb=booleanKey(f),rb=booleanKey(s);if(lb&&rb)return lb===rb;
+const su=v=>normalize(v).replace(/[\u2020*]+/g,"").replace(/(?:квтч|квт\/ч|квт|вт|см|мм|кг|°c|°|градусов|кwh|kwh)/g," ").replace(/\s+/g," ").trim();
+const l=su(f),r=su(s);if(!l||!r)return l===r;
+if(l===r||l.includes(r)||r.includes(l))return true;
+const ln=numbersOf(l),rn=numbersOf(r);
+if(ln.length>0&&ln.length===rn.length&&(ln.every((n,i)=>Math.abs(n-rn[i])<0.01)||ln.slice().sort((a,b)=>a-b).every((n,i)=>Math.abs(n-rn.slice().sort((a,b)=>a-b)[i])<0.01)))return true;
+const lk=v=>normalize(v).replace(/климатический класс|температурные режимы/g," ").split(/[^a-zа-яё0-9]+/).filter(Boolean).sort().join(" ");
+if(/климатический класс/.test(l+r)&&lk(l)===lk(r))return true;
+return false;
+}
+function foldHomoglyphs(v){return String(v??"").replace(/[АаВвЕеКкМмНнОоРрСсТтХх]/g,l=>({А:"A",а:"a",В:"B",в:"b",Е:"E",е:"e",К:"K",к:"k",М:"M",м:"m",Н:"H",н:"h",О:"O",о:"o",Р:"P",р:"p",С:"C",с:"c",Т:"T",т:"t",Х:"X",х:"x"}[l]||l));}
+function semanticValue(v){
+const s=normalize(v).replace(/[\u2020*]+/g,"").replace(/стеклокерамическ[а-яё]*/g,"стеклокерамика").replace(/стеклокерамик[а-яё]*/g,"стеклокерамика").replace(/no\s*frost/g,"nofrost").replace(/стеклян[а-яё]*/g,"стекло").replace(/эмалирован[а-яё]*/g,"эмаль").replace(/газов[а-яё]*/g,"газ").replace(/электрон[а-яё]*/g,"электронное управление").replace(/автоматическ[а-яё]*/g,"автоматический").replace(/слайдер[а-яё]*|сенсор[а-яё]*/g,"электронное управление").replace(/механическ[а-яё]*/g,"механическое управление").replace(/черн[а-яё]*/g,"черный").replace(/бел[а-яё]*/g,"белый").replace(/серебрист[а-яё]*/g,"серебристый").replace(/светов[а-яё]*/g,"свет").replace(/звуков[а-яё]*/g,"звук").replace(/рамк[а-яё]*/g,"рамка").replace(/нержавеющ[а-яё]*\s*сталь/g,"нержавеющая сталь").replace(/\b(?:варочная|варочные|панель|поверхность)\b/g," ").replace(/\s+/g," ").trim();
+return normalize(foldHomoglyphs(s));
+}
+function compareText(f,s){
+if(normalize(f)===normalize(s))return true;if(valuesEqual(f,s))return true;
+const ct=v=>{const k=normalize(v);if(/электрон|сенсор|слайдер|slider|touch|цифров/.test(k))return"electronic";if(/механическ|поворотн/.test(k))return"mechanical";return"";};
+const lc=ct(f),rc=ct(s);if(lc&&lc===rc)return true;
+const l=semanticValue(f),r=semanticValue(s);if(!l||!r)return false;
+if(l===r||l.includes(r)||r.includes(l))return true;
+const lt=l.split(/[^a-zа-яё0-9]+/).filter(t=>t.length>2),rt=r.split(/[^a-zа-яё0-9]+/).filter(t=>t.length>2);
+if(lt.length>0&&rt.length>0){
+const inter=lt.filter(t=>rt.some(r=>r.includes(t)||t.includes(r)));
+const d=[...new Set(inter)];
+if(d.length>=2)return true;if(d.length===1&&d[0].length>=6)return true;
+}
+return false;
+}
+function parseDimensionParts(v){return normalize(v).replace(/(?:см|мм)/g,"").split(/\s*x\s*/).map(p=>numbersOf(p));}
+function dimensionFormatIssues(v,title=""){
+const raw=String(v??"").trim(),issues=[];
+if(!/\d\s*[xх×]\s*\d/i.test(raw))return issues;
+const parts=raw.split(/\s*[xх×]\s*/i).filter(p=>/\d/.test(p));
+const isTriplet=parts.length>=3;
+const isDim=/размер|габарит|ниш|высот|ширин|глубин/i.test(String(title));
+if(!isTriplet&&!isDim)return issues;
+if(/(?:\d\s*x\s*\d|\d+x\d)/i.test(raw))issues.push("использована английская «x»; нужен русский разделитель «х»");
+else if(/\d\s*×\s*\d/.test(raw))issues.push("использован знак «×»; нужен русский разделитель «х»");
+return issues;
+}
+function formatOfficialValue(v,t){
+let r=String(v??"").trim();
+r=r.replace(/(\d),(\d)/g,"$1.$2");
+if(/\d\s*[xх×]\s*\d/i.test(r)){r=r.replace(/\s*[xх×]\s*/gi," х ").replace(/\s*(см|мм)\s*$/i,"").replace(/\s+/g," ").trim();}
+return r;
+}
+function compareNumberPart(lv,ov,lu,ou){
+const l=numbersOf(lv).map(n=>n*(lu?.factor||1)),o=numbersOf(ov).map(n=>n*(ou?.factor||1));
+if(!l.length||!o.length)return null;
+if(lu?.group&&ou?.group&&lu.group!==ou.group)return false;
+if(l.length===o.length)return l.every((n,i)=>Math.abs(n-o[i])<0.01);
+if(l.length===1&&o.length>1)return l[0]>=Math.min(...o)-0.01&&l[0]<=Math.max(...o)+0.01;
+if(o.length===1&&l.length>1)return o[0]>=Math.min(...l)-0.01&&o[0]<=Math.max(...l)+0.01;
+return false;
+}
+function compareDimension(lv,lm,e){
+const lp=parseDimensionParts(lv),op=parseDimensionParts(e.value);
+if(lp.length!==3||op.length!==3)return null;
+const gb=(p,u)=>p.map(x=>(x[0]||0)*(u?.factor||1)).sort((a,b)=>b-a);
+const lu=unitsForLabel(lm.title,lv),ou=unitsForLabel(e.label,e.value);
+const lv2=gb(lp,lu),ov2=gb(op,ou);
+if(lv2.every((v,i)=>Math.abs(v-ov2[i])<=1.5))return true;
+const ln=Object.fromEntries(lm.order.map((n,i)=>[n,lp[i]]));
+const on=Object.fromEntries(e.dimensionOrder.map((n,i)=>[n,op[i]]));
+return["height","width","depth"].every(n=>compareNumberPart(ln[n]?.join(" "),on[n]?.join(" "),lu,ou)===true);
+}
+function compareWithEntry(lv,lt,e,lm){
+if(lm?.dimension&&e.dimensionKind){
+if(lm.part&&e.dimensionPart)return compareNumberPart(lv,e.value,unitsForLabel(lt,lv),e.unit||unitsForLabel(e.label,e.value));
+return compareDimension(lv,lm,e);
+}
+const lc=canonicalLabel(lt);
+if(lc==="oven-type"&&!/(?:газ|электр|комбинир)/i.test(e.value))return null;
+if(lc==="control"){
+const cf=v=>{const k=normalize(v);if(/электрон|сенсор|слайдер|slider|touch|цифров/.test(k))return"electronic";if(/механическ|поворотн/.test(k))return"mechanical";if(/кнопк|переключател/.test(k))return"form";return"";};
+const lf=cf(lv),of=cf(e.value);if(lf==="form"||of==="form"){if(lf!==of)return null;}
+}
+if(isMissing(lv))return isMissing(e.value)?true:false;
+if(isPositive(lv)){if(isPositive(e.value))return true;const on=numbersOf(e.value);if(on.length>0&&on.some(n=>n>0))return true;if(e.value&&e.value.length>3&&!isNegative(e.value))return true;return false;}
+if(isNegative(lv)){if(isNegative(e.value))return true;const on=numbersOf(e.value);if(on.length>0&&on.every(n=>n===0))return true;return false;}
+if(isPositive(e.value)&&!isMissing(lv)&&!isNegative(lv)){const fv=normalize(lv);if(/(?:автомат|электроподжиг|газ-контрол|инвертор|no\s*frost|fresh|steam|пар|aqua|пирол|катал|освещ|подсвет|индикатор|индикац|цифров|защит|таймер|диспле|connect|adapt|super|big|есть|да)/.test(fv))return true;}
+if(compareText(lv,e.value))return true;
+const ln=numbersOf(lv),on=numbersOf(e.value);
+if(ln.length&&on.length){const nr=compareNumberPart(lv,e.value,unitsForLabel(lt,lv),unitsForLabel(e.label,e.value));if(nr!==null)return nr;}
+return false;
+}
+
+function readTable(){
+const s=isProductPage()?".characteristics__row":".compare-table-block__row.js-compare-row";
+return[...document.querySelectorAll(s)].map(el=>{
+const te=el.querySelector(isProductPage()?".characteristics__name":".js-compare-cell-title");
+let vs=[];
+if(isProductPage())vs=[textOf(el.querySelector(".characteristics__property"))];
+else vs=[...el.querySelectorAll(".swiper-wrapper > .compare-table-block__cell.js-compare-cell")].map(textOf);
+return{element:el,title:textOf(te),titleElement:te,values:vs};
+}).filter(r=>r.title);
+}
+function rowCells(r){if(isProductPage())return[r.element.querySelector(".characteristics__property")];return[...r.element.querySelectorAll(".swiper-wrapper > .compare-table-block__cell.js-compare-cell")];}
+function findRow(rs,p){return rs.find(r=>p.test(normalizeLabel(r.title)));}
+function compactModel(v){return foldHomoglyphs(v).toLowerCase().replace(/[^a-z0-9]/g,"").toUpperCase();}
+function modelMatches(v,m){const h=compactModel(v),n=compactModel(m);return n.length>=4&&(h.includes(n)||n.includes(h));}
+function modelCandidates(p){
+const c=new Set();
+const add=v=>{const m=String(v??"").trim().replace(/\s+/g,"").toUpperCase();if(/^\d{4,}$/.test(m)){c.add(m);return;}if(!/[A-ZА-Я]\d/.test(m)&&!/\d[A-ZА-Я]/.test(m))return;if(compactModel(m).length<4)return;c.add(m);c.add(compactModel(m));};
+const ex=v=>{const ms=String(v??"").match(/\b[A-Za-zА-Яа-я]{1,8}\s*[-\/]?\s*\d{1,6}(?:\s*[-\/]?\s*[A-Za-z0-9А-Яа-я]{1,12}){0,3}\b/g)||[];ms.forEach(add);};
+ex(p.name);ex(p.href);if(p.article&&/^\d{4,}$/.test(String(p.article).trim()))add(p.article);
+return[...c];
+}
+function readProducts(rs){
+if(isProductPage()){const h1=document.querySelector('h1');const n=h1?h1.textContent.trim():document.title;const ar=findRow(rs,/^артикул/);const p={name:n,href:window.location.href,id:"",article:ar?.values[0]||""};p.model=modelCandidates(p)[0]||"";return[p];}
+const ar=findRow(rs,/^артикул/);
+return[...document.querySelectorAll(".comparison-card.swiper-slide")].map((c,i)=>{const t=c.querySelector(".comparison-card__type-and-title");const rb=c.querySelector(".js-compare_remove");const p={name:textOf(t)||"Товар без названия",href:t?.href||c.querySelector("a[href]")?.href||"",id:rb?.dataset.id||"",article:ar?.values[i]||""};p.model=modelCandidates(p)[0]||"";return p;});
+}
+function productLabel(ps,i){const p=ps[i];if(!p)return`товар №${i+1}`;return p.name+(p.id?` (ID ${p.id})`:"");}
+
+async function fetchEditBaseUrl(p){
+const k=p.id||p.href;if(editUrlCache.has(k))return editUrlCache.get(k);
+let url="";const d=document.querySelector('a.ctrl-btn[href*="iblock_element_edit"]');
+if(pageMode()==="product"&&d)url=d.href;
+if(!url&&p.href){try{const h=await requestHtml(p.href);const m=h.match(/href="([^"]*iblock_element_edit\.php\?[^"]+)"/);if(m)url=m[1].replace(/&amp;/g,"&");}catch(_){}}
+if(!url&&p.id)url=`https://gorenje-ru.ru/bitrix/admin/iblock_element_edit.php?IBLOCK_ID=${BITRIX_IBLOCK_ID}&type=gr_catalog&lang=ru&ID=${p.id}&find_section_section=-1&WF=Y`;
+editUrlCache.set(k,url);return url;
+}
+function editUrl(p,f){const b=p?.editBase||editUrlCache.get(p?.id||p?.href)||"";if(!b)return"";return b.split("#")[0]+(f?"#gcv="+encodeURIComponent(f):"");}
+function renderProductEditLinks(ps){document.querySelectorAll(".comparison-card.swiper-slide").forEach((c,i)=>{if(c.querySelector(".gcv-edit-card"))return;const p=ps[i];if(!p?.editBase)return;const a=document.createElement("a");a.className="gcv-edit-card";a.href=p.editBase;a.target="_blank";a.rel="noreferrer";a.textContent=" ✏️";a.title="Редактировать карточку в Битрикс";(c.querySelector(".comparison-card__type-and-title")||c).append(a);});}
+function patchCardEditButton(r,rs){const b=document.querySelector('a.ctrl-btn[href*="iblock_element_edit"]');if(!b)return;const fb=rs.find(x=>(r.rowResults.get(x)?.status||"ok")!=="ok");if(fb)b.href=b.href.split("#")[0]+"#gcv="+encodeURIComponent(fb.title);}
+function findAdminFieldRow(t){
+let best=null;document.querySelectorAll("td,th,label,span,b,div").forEach(el=>{
+if(el.children.length>2)return;const tx=normalizeLabel(el.textContent||"");
+if(!tx||tx.length>t.length+30)return;
+if(tx===t||tx.startsWith(t)||(t.startsWith(tx)&&tx.length>5)){if(!best||el.textContent.length<best.textContent.length)best=el;}
+});if(!best)return null;return best.closest("tr")||best.closest(".adm-detail-content-item")||best.parentElement;
+}
+function highlightAdminRow(r){
+const s=document.createElement("style");s.textContent=`.gcv-admin-target{outline:3px solid #ff6600!important;outline-offset:2px;background:#fff3e0!important;}.gcv-admin-target-input{outline:2px solid #ff6600!important;background:#fff8ef!important;}`;
+document.head.appendChild(s);r.scrollIntoView({block:"center",behavior:"smooth"});r.classList.add("gcv-admin-target");
+r.querySelectorAll("input,select,textarea").forEach(i=>i.classList.add("gcv-admin-target-input"));
+}
+function initAdminHighlight(){
+const m=location.hash.match(/^#gcv=(.+)$/);if(!m)return;
+const t=normalizeLabel(decodeURIComponent(m[1]));if(!t)return;
+let tr=0;const ti=setInterval(()=>{tr+=1;const r=findAdminFieldRow(t);if(r){clearInterval(ti);highlightAdminRow(r);}else if(tr>40)clearInterval(ti);},250);
+}
+
+function emptyResult(){return{rowResults:new Map(),cellResults:new Map(),findings:[],officialSummary:null};}
+function addDetail(t,d){if(!d)return;if(!t.details)t.details=[];const s=`${d.label||""}|${d.anchorLabel||""}|${d.value||""}|${d.source||""}`;if(!t.details.some(i=>`${i.label||""}|${i.anchorLabel||""}|${i.value||""}|${i.source||""}`===s))t.details.push(d);}
+function noteResult(r,row,i,s,m,tt,src="",af=true,d=null){
+if(!row)return;
+const pr=r.rowResults.get(row)||{status:"ok",messages:new Set(),tooltips:new Set()};
+if(STATUS_RANK[s]>STATUS_RANK[pr.status])pr.status=s;
+pr.messages.add(m);if(tt)pr.tooltips.add(tt);addDetail(pr,d);r.rowResults.set(row,pr);
+const c=rowCells(row)[i];
+if(c){
+const pc=r.cellResults.get(c)||{status:"ok",messages:new Set(),tooltips:new Set(),sources:new Set()};
+if(STATUS_RANK[s]>STATUS_RANK[pc.status])pc.status=s;
+pc.messages.add(m);pc.productIndex=i;pc.rowTitle=row.title;
+if(tt)pc.tooltips.add(tt);if(src)pc.sources.add(src);addDetail(pc,d);r.cellResults.set(c,pc);
+}
+if(af&&s!=="ok")r.findings.push(m);
+}
+
+function runLocalValidation(rows,products){
+const r=emptyResult();
+const dg=[
+{label:"Габариты ВхШхГ",composite:/габаритные?\s+размеры?\s*\(?\s*в\s*(?:x|х)?\s*ш\s*(?:x|х)?\s*г/i,parts:[/^высота(?:,|\s)/,/^ширина(?:,|\s)/,/^глубина(?:,|\s)/]},
+{label:"Размеры в упаковке ВхШхГ",composite:/размеры?\s+в\s+упаковке?\s*\(?\s*в\s*(?:x|х)?\s*ш\s*(?:x|х)?\s*г/i,parts:[/^высота\s+упаковки/,/^ширина\s+упаковки/,/^глубина\s+упаковки/]}
+];
+dg.forEach(d=>{
+const c=findRow(rows,d.composite);if(!c)return;
+const p=d.parts.map(x=>findRow(rows,x));
+c.values.forEach((v,i)=>{
+if(p.some(x=>!x))return;
+const pd=parseDimensionParts(v),sep=p.map(x=>x.values[i]||"");
+const cm=pd.length===3&&pd.every(x=>x.length>0)&&sep.every(x=>numberOf(x)!==null);
+if(!cm)return;
+const lm={dimension:true,order:["height","width","depth"],title:c.title};
+const mt=[0,1,2].map(pi=>compareNumberPart(pd[pi].join(" "),sep[pi],unitsForLabel(c.title,v),unitsForLabel(p[pi].title,sep[pi])));
+const st=mt.every(x=>x===true)?"ok":"error";
+if(st!=="ok"){const m=`${d.label}: составное значение не совпадает с отдельными полями у ${productLabel(products,i)}`;const tt=`Локально: ${v} != ${sep.join(' x ')}`;[c,...p].forEach(row=>noteResult(r,row,i,st,m,tt));}
+});
+});
+rows.forEach(row=>{row.values.forEach((v,i)=>{
+const is=dimensionFormatIssues(v,row.title);if(!is.length)return;
+const m=`${row.title}: ${is.join("; ")} у ${productLabel(products,i)}`;
+noteResult(r,row,i,"error",m,is.join("; "));
+});});
+const tr=findRow(rows,/^тип$|^вид$/),gb=findRow(rows,/конфорок\s+газовых/),ig=findRow(rows,/электроподжиг/);
+if(ig&&(tr||gb)){ig.values.forEach((v,i)=>{
+const isg=/газ/.test(normalize(tr?.values[i])),gc=numberOf(gb?.values[i]),isgc=gc!==null&&gc>0;
+if(!isg&&!isgc)return;
+if(isMissing(v)||isNegative(v))noteResult(r,ig,i,"error",`Электроподжиг: у газовой панели не должно быть «Нет» или пустого значения (${productLabel(products,i)})`,"У газовой панели должен быть электроподжиг");
+});}
+return r;
+}
+
+function requestHtml(url){
+const g=typeof GM_xmlhttpRequest==="function"?GM_xmlhttpRequest:(typeof GM!=="undefined"&&typeof GM.xmlHttpRequest==="function"?GM.xmlHttpRequest:null);
+if(g){return new Promise((res,rej)=>{g({method:"GET",url,timeout:30000,onload:r=>{if(r.status>=200&&r.status<400)res(r.responseText);else rej(new Error(`HTTP ${r.status}`));},ontimeout:()=>rej(new Error("тайм-аут")),onerror:()=>rej(new Error("ошибка сети"))});});}
+return fetch(url,{credentials:"omit"}).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.text();});
+}
+function requestJson(url,opts={}){
+const g=typeof GM_xmlhttpRequest==="function"?GM_xmlhttpRequest:null;
+const ro={method:opts.method||"GET",url,headers:opts.headers||{},data:opts.body||"",timeout:45000};
+if(g){return new Promise((res,rej)=>{g({...ro,onload:r=>{if(r.status<200||r.status>=400){let m=`HTTP ${r.status}`;try{m=JSON.parse(r.responseText)?.error?.message||m;}catch(_){}rej(new Error(m));return;}try{res(JSON.parse(r.responseText));}catch(_){rej(new Error("Не JSON"));}},ontimeout:()=>rej(new Error("тайм-аут")),onerror:()=>rej(new Error("ошибка"))});});}
+return fetch(url,{method:ro.method,headers:ro.headers,body:ro.data}).then(async r=>{if(!r.ok){let m=`HTTP ${r.status}`;try{m=(await r.json())?.error?.message||m;}catch(_){}throw new Error(m);}return r.json();});
+}
+
+function isOwnSite(u){try{const h=new URL(u).hostname.toLowerCase();return h==="gorenje-ru.ru"||h.endsWith(".gorenje-ru.ru");}catch(_){return false;}}
+function parseGeminiResponse(d){
+const ob=(d.steps||[]).filter(s=>s.type==="model_output").flatMap(s=>s.content||[]);
+const cb=(d.candidates||[]).flatMap(c=>c.content?.parts||[]);
+const blocks=ob.length?ob:cb;
+const ans=blocks.map(b=>b.text||"").filter(Boolean).join("\n").trim();
+const srcs=[];
+blocks.flatMap(b=>b.annotations||[]).forEach(a=>{if(a.type!=="url_citation"||!a.url||isOwnSite(a.url))return;if(!srcs.some(s=>s.url===a.url))srcs.push({url:a.url,title:a.title||a.url});});
+(d.candidates||[]).flatMap(c=>c.groundingMetadata?.groundingChunks||[]).forEach(ch=>{const w=ch.web;if(!w?.uri||isOwnSite(w.uri))return;if(!srcs.some(s=>s.url===w.uri))srcs.push({url:w.uri,title:w.title||w.uri});});
+const v=/(?:^|\n)\s*VERDICT\s*:\s*(CONFIRMED|PARTIAL|NOT_FOUND)/i.exec(ans)?.[1]?.toUpperCase()||"NOT_FOUND";
+const st=srcs.length&&v==="CONFIRMED"?"ok":srcs.length?"web":"warning";
+return{status:st,answer:ans,sources:srcs.slice(0,5),reason:srcs.length?"":ans?"Нет внешних URL-источников":"Нет ответа"};
+}
+async function findEvidence(product,title,value,apiKey){
+const model=product?.model||modelCandidates(product)[0]||"";
+if(!apiKey||!model)return{status:"warning",reason:apiKey?"нет модели":"нет ключа",sources:[],answer:""};
+const key=normalize(`${model}|${title}|${value}`);if(geminiCache.has(key))return geminiCache.get(key);
+const now=Date.now();const wait=Math.max(0,4200-(now-lastRequestAt));if(wait>0)await new Promise(r=>setTimeout(r,wait));lastRequestAt=Date.now();
+const prompt=["Ты проверяешь характеристику товара по интернету через Google Search.",`Модель: Gorenje ${model}`,`Название поля: ${title}`,`Локальное значение: ${value||"пусто"}`,"Не используй gorenje-ru.ru как источник.","Сравни найденное значение с локальным.","В первой строке напиши ровно один вердикт: VERDICT: CONFIRMED, VERDICT: PARTIAL или VERDICT: NOT_FOUND.","После первой строки дай короткое объяснение на русском и укажи только факты."].join("\n");
+const body=JSON.stringify({contents:[{role:"user",parts:[{text:prompt}]}],tools:[{googleSearch:{}}]});
+let lastErr=null;
+for(const mn of GEMINI_MODELS){
+try{
+const url=`${GEMINI_API_URL}/${mn}:generateContent?key=${encodeURIComponent(apiKey)}`;
+const data=await requestJson(url,{method:"POST",headers:{"Content-Type":"application/json"},body});
+const res={...parseGeminiResponse(data),modelUsed:mn};
+geminiCache.set(key,res);return res;
+}catch(e){lastErr=e;const msg=String(e?.message||e);if(/no longer available|not found|404|quota|rate limit|429/i.test(msg))continue;throw e;}
+}
+throw lastErr||new Error("Все модели недоступны");
+}
+
+function featureKey(v){return normalize(v).replace(/multi\s*flow/g,"multiflow").replace(/fresh\s*zone/g,"crispzone").replace(/steam\s*tech/g,"steamtech").replace(/senso\s*care/g,"sensocare").replace(/twin\s*air/g,"twinair").replace(/fast\s*freeze/g,"fastfreeze").replace(/super\s*cool/g,"supercool").replace(/adapt\s*tech/g,"adapttech").replace(/convert\s*active/g,"convertactive").replace(/aqua\s*clean/g,"aquaclean").replace(/silver\s*matte/g,"silvermatte").replace(/big\s*space/g,"bigspace").replace(/compact\s*door/g,"compactdoor").replace(/[^a-zа-яё0-9]/g,"");}
+function featureNameMatches(lt,lv,on){
+const l=featureKey(`${lt} ${lv}`),o=featureKey(on);
+if(!l||!o)return false;if(o.length>=5&&(l.includes(o)||o.includes(l)))return true;
+const ign=new Set(["тип","система","функция","технология","контейнер","зона","режим","работа"]);
+return normalize(on).split(/[^a-zа-яё0-9]+/).filter(t=>t.length>=3&&!ign.has(t)).some(t=>featureKey(lt).includes(featureKey(t))||featureKey(lv).includes(featureKey(t)));
+}
+function isOfficialProductUrl(h){try{const u=new URL(h,OFFICIAL_ORIGIN),p=u.pathname.split("/").filter(Boolean);return u.origin===OFFICIAL_ORIGIN&&p[0]==="products"&&p.length>=4&&!u.pathname.includes("/compare/")&&!u.pathname.includes("/filter/");}catch(_){return false;}}
+function officialSearchCandidates(html){const d=new DOMParser().parseFromString(html,"text/html");return[...new Map([...d.querySelectorAll("a[href]")].map(l=>({text:textOf(l),href:new URL(l.getAttribute("href"),OFFICIAL_ORIGIN).href})).filter(i=>isOfficialProductUrl(i.href)).map(i=>[i.href,i])).values()];}
+async function findOfficialUrl(p){
+const ms=modelCandidates(p),se=new Set();
+for(const m of ms){
+const su=`${OFFICIAL_ORIGIN}/search/?q=${encodeURIComponent(m)}`;if(se.has(su))continue;se.add(su);
+try{const h=await requestHtml(su);const cs=officialSearchCandidates(h);const ex=cs.find(i=>modelMatches(`${i.text} ${i.href}`,m));if(ex)return{url:ex.href,model:m};if(cs.length===1&&compactModel(m).length>=5)return{url:cs[0].href,model:m};}catch(e){console.warn("[GCV] search fail",m,e);}
+}
+return null;
+}
+function dimensionMeta(l){
+const k=normalizeLabel(l);
+if(/размеры\s*\(?\s*ш\s*x\s*в\s*x\s*г|габаритные\s+размеры|^размеры$/.test(k))return{dimensionKind:"main",dimensionOrder:["width","height","depth"],composite:true};
+if(/размеры\s+в\s+упаковке/.test(k))return{dimensionKind:"package",dimensionOrder:["width","height","depth"],composite:true};
+if(/монтажные\s+размеры|размер\s+ниши/.test(k))return{dimensionKind:"niche",dimensionOrder:["width","height","depth"],composite:true};
+return null;
+}
+function localDimensionMeta(l,v=""){
+const k=normalizeLabel(l),o=/ш\s*x\s*в\s*x\s*г/.test(k)?["width","height","depth"]:["height","width","depth"];
+const p=parseDimensionParts(v);
+if(/размеры?\s+в\s+упаковке|размеры?\s+упаковки/.test(k)&&p.length===3)return{dimension:true,kind:"package",order:o,title:l};
+if(/размер\s+ниши|монтажные\s+размеры/.test(k)&&p.length===3)return{dimension:true,kind:"niche",order:o,title:l};
+if(/(?:габаритные?\s+размеры?|габариты|^размеры?$)/.test(k)&&p.length===3)return{dimension:true,kind:"main",order:o,title:l};
+const pt=k.startsWith("высота")?"height":k.startsWith("ширина")?"width":k.startsWith("глубина")?"depth":"";
+if(!pt)return null;const kd=k.includes("упаковки")?"package":k.includes("ниши")?"niche":"main";
+return{dimension:true,kind:kd,part:pt,title:l};
+}
+function parseOfficialPage(html,url){
+const d=new DOMParser().parseFromString(html,"text/html"),es=[],se=new Set();
+const ae=e=>{const k=`${e.group}|${e.label}|${e.value}|${e.dimensionPart||""}`;if(!e.label||se.has(k))return;se.add(k);es.push({sourceUrl:url,...e});};
+const cl=e=>{if(!e)return"";const p=e.querySelectorAll('.part');if(p.length>0)return Array.from(p).map(x=>x.textContent.trim()).join(" ").replace(/\s+/g," ").trim();return String(e.innerText||"").replace(/\s+/g," ").trim();};
+const title=cl(d.querySelector(".products-detail__h1")||d.querySelector("h1"));
+d.querySelectorAll(".products-detail__main-props-list-item").forEach(i=>ae({group:"summary",label:cl(i.querySelector(".products-detail__main-props-list-item-name")),value:cl(i.querySelector(".products-detail__main-props-list-item-val"))}));
+d.querySelectorAll(".products-detail__tech-groups-list-item").forEach(i=>{const gn=cl(i.closest(".products-detail__tech-group")?.querySelector(".products-detail__tech-groups-title"))||"tech";ae({group:gn,label:cl(i.querySelector(".products-detail__tech-groups-list-item-name")),value:cl(i.querySelector(".products-detail__tech-groups-list-item-val"))});});
+const fs=[...d.querySelectorAll(".products-detail__advantages-item")].map(i=>({subtitle:cl(i.querySelector(".products-detail__advantages-subtitle")),title:cl(i.querySelector(".products-detail__advantages-title")),text:cl(i.querySelector(".products-detail__advantages-text"))}));
+const fns=[...new Set([...[...d.querySelectorAll(".products-detail__advantages-thumbs-item-text")].map(cl),...fs.flatMap(i=>[i.subtitle,i.title])].filter(Boolean))];
+const ofc={url,title,entries:es,features:fs,featureNames:fns,featureText:[...fns,...fs.map(i=>`${i.subtitle} ${i.title} ${i.text}`)].join(" ")};
+const des=[];
+es.forEach(e=>{const m=dimensionMeta(e.label),p=parseDimensionParts(e.value);if(!m||p.length!==3||p.some(x=>!x.length))return;e.dimensionKind=m.dimensionKind;e.dimensionOrder=m.dimensionOrder;e.isDimensionComposite=true;m.dimensionOrder.forEach((pn,i)=>{des.push({group:e.group,label:`derived ${m.dimensionKind} ${pn}`,anchorLabel:e.label,value:p[i].join("-"),dimensionKind:m.dimensionKind,dimensionPart:pn,unit:unitInfo(e.value)||unitInfo(e.label),derived:true});});});
+des.forEach(ae);ofc.entries=es;return ofc;
+}
+
+const STOP_WORDS=new Set(["количество","тип","материал","цвет","размер","вес","класс","форма","система","наличие","есть","нет","да","объем","мощность","покрытие","дверца","панель","управление","переключатели","программатор","таймер","освещение","шарнир","решетка","противень","ящик","плита","духовка","варочная","поверхность","шкаф","электрическая","газовая","индукционная"]);
+const SEMANTIC_BLACKLIST=[
+{local:/тип/i,forbidden:[/ящик/,/мощность/,/вес/,/размер/,/объем/,/потреблен/,/напряжен/,/частот/,/покрыт/,/цвет/,/материал/,/форм/,/класс/,/дверц/,/шарнир/,/решетк/,/противен/,/конфорк/]},
+{local:/мощность/i,forbidden:[/тип/,/ящик/,/вес/,/размер/,/объем/,/класс/,/покрыт/,/цвет/,/материал/,/конфорк/]},
+{local:/вес/i,forbidden:[/тип/,/ящик/,/мощность/,/размер/,/объем/,/класс/,/покрыт/,/цвет/]},
+{local:/размер|габарит|высота|ширина|глубина/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/объем/,/класс/,/покрыт/,/цвет/]},
+{local:/объем/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/класс/,/покрыт/,/цвет/,/форм/]},
+{local:/класс/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/покрыт/,/цвет/]},
+{local:/цвет/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/,/материал/,/покрыт/,/управл/]},
+{local:/материал/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/,/цвет/,/форм/,/управл/]},
+{local:/покрыт/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/,/цвет/,/материал/]},
+{local:/страна/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/]},
+{local:/управление|переключател|таймер|программатор/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/,/цвет/,/материал/]},
+{local:/освещен|подсветк/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/]},
+{local:/дверц|стекл|шарнир/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/,/цвет/,/материал/,/конфорк/]},
+{local:/очистк|пар|пиролит|каталит/i,forbidden:[/тип/,/ящик/,/мощность/,/вес/,/размер/,/объем/,/класс/]},
+{local:/противен|решетк|ящик|комплект|оборудован/i,forbidden:[/тип/,/мощность/,/вес/,/размер/,/объем/,/класс/,/цвет/,/материал/,/конфорк/]},
+{local:/конфорк|зона\s+нагрева/i,forbidden:[/тип/,/ящик/,/вес/,/размер/,/объем/,/класс/,/цвет/,/материал/,/дверц/,/стекл/]}
+];
+function isSemanticallyCompatible(lt,ol){const ln=normalize(lt),on=normalize(ol);for(const r of SEMANTIC_BLACKLIST){if(r.local.test(ln))for(const f of r.forbidden)if(f.test(on))return false;}return true;}
+function similarityScore(a,b){
+if(!isSemanticallyCompatible(a,b))return 0;
+if(canonicalLabel(a)===canonicalLabel(b))return 1;
+const x=normalizeLabel(a).split(/\s+/).filter(t=>t.length>2&&!STOP_WORDS.has(t));
+const y=normalizeLabel(b).split(/\s+/).filter(t=>t.length>2&&!STOP_WORDS.has(t));
+if(!x.length||!y.length)return 0;
+const us=["квт","квтч","вт","мм","см","кг","л","град","об","мин"];
+const xu=x.filter(t=>us.some(u=>t.includes(u))),yu=y.filter(t=>us.some(u=>t.includes(u)));
+if(xu.length>0&&yu.length>0){const s=new Set(yu);if(!xu.some(u=>s.has(u)))return 0;}
+else if(xu.length>0||yu.length>0){if(!/габарит|размер|высота|ширина|глубина/i.test(a+b))return 0;}
+const tk=t=>foldHomoglyphs(t).toLowerCase();
+const s=new Set(y.map(tk));const i=x.filter(t=>s.has(tk(t)));
+if(i.length===0)return 0;
+const mw=i.reduce((s,t)=>s+t.length,0);
+const tu=[...new Set([...x,...y])];const tw=tu.reduce((s,t)=>s+t.length,0);
+return tw?mw/tw:0;
+}
+function labelDescriptor(l,v=""){
+const k=normalizeLabel(l),d={labels:[],featureTerms:[],valueHint:""};
+if(FIELD_MAPPING[k]){d.labels=FIELD_MAPPING[k];return d;}
+if(k.includes("дисплей"))d.labels=[/^дисплей/,/^цифровой дисплей/];
+else if(k.includes("загрузка")&&k.includes("кг"))d.labels=[/^загрузка при сушке/,/^загрузка/,/^максимальная загрузка/];
+else if(k.includes("сенсор влажности")){d.labels=[/^сенсоры$/];d.valueHint="влажности";}
+else if(["хлопок","шерсть","синтетика","спорт","деликат","рубаш","постель","быстр","пухов","детск","микс","антиаллерг","экстрагигиен"].some(p=>k.includes(p))){d.labels=[/^(?:основные|специальные|режимы) программы/,/^программы сушки$/,/^программы$/];d.valueHint=k.split(' ')[0];}
+else if(k.includes("размеры в упаковке")||k.includes("размер ниши")||k.includes("габариты")||/^высота|^ширина|^глубина/.test(k)){d.labels=[new RegExp(`^${k.replace(/\s+(см|мм|\(.*\))$/,"").trim()}$`)];}
+else if(/(?:особенност|функц|технолог|создан.*собственн|личн.*параметр)/.test(k)){d.featureTerms=[k.replace(/\s*\(.*\)/,"").replace(/,\s*шт$/,"").trim()];}
+else if(k.includes("нагрев")||k.includes("гриль")||k.includes("пар")||k.includes("сушка")||k.includes("пицца")||k.includes("размораживание")||k.includes("регенерац")||k.includes("сувид")||k.includes("air fry")||k.includes("gratin")||k.includes("frozen bake")||k.includes("slow bake")||k.includes("adapt bake")||k.includes("multi steam")||k.includes("pure steam")||k.includes("home made")||k.includes("big space")||k.includes("super size")||k.includes("connectlife")||k.includes("totaldry")||k.includes("aquastop")||k.includes("steamtech")||k.includes("twin air")||k.includes("no frost")||k.includes("fresh zone")||k.includes("bigspace")||k.includes("supersize")||k.includes("extrasteam")||k.includes("perfect grill")||k.includes("вариогриль")||k.includes("compact door")||k.includes("aqua clean")||k.includes("silver matte")||k.includes("ecoclean")){d.featureTerms=[k.replace(/\s*\(.*\)/,"").replace(/,\s*шт$/,"").trim()];}
+else d.labels=[new RegExp(`^${k.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}$`)];
+return d;
+}
+function findReference(lt,lv,ofc){
+const zk=normalizeLabel(lt);
+if(zk==="размеры"&&parseDimensionParts(lv).length!==3)return null;
+const zs=/^(передняя|задняя)(?:\s|,)/.exec(zk)?.[1];
+if(zs&&!/левая|правая/.test(zk)&&numbersOf(lv).length>=2){
+const dia=ofc.entries.find(e=>{const l=normalizeLabel(e.label);return new RegExp(`^ø\\s*${zs}`).test(l)||new RegExp(`^${zs}.*мм$`).test(l);});
+const pw=ofc.entries.find(e=>new RegExp(`^мощность ${zs==="передняя"?"передн":"задн"}`).test(normalizeLabel(e.label)));
+if(dia&&pw)return{entry:{label:`${dia.label} + ${pw.label}`,value:`${dia.value}; ${pw.value}`,sourceUrl:ofc.url,diameter:dia,power:pw},localMeta:null,kind:"zone"};
+}
+const lm=localDimensionMeta(lt,lv);
+if(lm){const c=ofc.entries.find(e=>e.dimensionKind===lm.kind&&(lm.part?e.dimensionPart===lm.part:e.isDimensionComposite));if(c)return{entry:c,localMeta:lm,kind:"spec"};}
+const lc=canonicalLabel(lt);
+if(lc&&lc!=="тип"){
+const cc=ofc.entries.filter(e=>canonicalLabel(e.label)===lc&&isSemanticallyCompatible(lt,e.label));
+if(cc.length){
+const gvl=new Set(["полезный объем","объем нетто","объем рабочей камеры","объем духовки","объем духового шкафа"]);
+const vl=normalizeLabel(lt).replace(/\s+(?:см|мм|кг|л|вт|квт|квтч|шт)$/,"").trim();
+const igv=lc==="usable-volume"&&gvl.has(vl);
+const hcv=ofc.entries.some(e=>/^объем (?:нетто|брутто) [хм] о/.test(normalizeLabel(e.label)));
+const hvm=cc.some(e=>compareWithEntry(lv,lt,e,lm)===true);
+if(igv&&hcv&&!hvm)return null;
+cc.sort((a,b)=>{const am=compareWithEntry(lv,lt,a,lm)===true?1:0;const bm=compareWithEntry(lv,lt,b,lm)===true?1:0;return bm-am||Number(b.group==="summary")-Number(a.group==="summary");});
+return{entry:cc[0],localMeta:lm,kind:"alias"};
+}
+}
+const desc=labelDescriptor(lt,lv);
+let cands=ofc.entries.filter(e=>desc.labels.some(p=>p.test(normalizeLabel(e.label))));
+if(desc.valueHint){
+const hi=cands.filter(e=>new RegExp(desc.valueHint,"i").test(normalize(e.value)+" "+normalize(ofc.title)));
+if(hi.length)cands=hi;else if(cands.length===0){const gh=ofc.entries.find(e=>new RegExp(desc.valueHint,"i").test(normalize(e.value)));if(gh)cands=[gh];}
+}
+if(cands.length){
+const rk=cands.map(e=>{let vs=0;const vr=compareWithEntry(lv,lt,e,lm);if(vr===true)vs=100;else if(vr===null)vs=5;return{entry:e,score:vs+similarityScore(lt,e.label)+Number(e.group==="summary")*0.05};}).sort((a,b)=>b.score-a.score);
+return{entry:rk[0].entry,localMeta:lm,kind:"spec"};
+}
+const gf=(ofc.featureNames||[]).find(n=>featureNameMatches(lt,lv,n));
+if(gf)return{entry:{label:`Функция: ${gf}`,value:"Да",sourceUrl:ofc.url,anchorLabel:gf,featureName:gf},localMeta:lm,kind:"feature-gallery"};
+const sc=ofc.entries.map(e=>({entry:e,score:similarityScore(lt,e.label)})).filter(i=>i.score>=0.50).sort((a,b)=>b.score-a.score);
+if(sc.length>0&&(sc.length===1||sc[0].score-sc[1].score>=0.08)){const b=sc[0];console.log(`%c[GCV] Fuzzy: "${lt}" → "${b.entry.label}" (${(b.score*100).toFixed(0)}%)`,'color:#007f83;font-weight:bold;');return{entry:b.entry,localMeta:lm,kind:"fuzzy"};}
+const ft=normalize(ofc.featureText+" "+ofc.entries.map(e=>e.value).join(" "));
+const term=desc.featureTerms.find(i=>ft.includes(normalize(i)));
+const tt=term?normalize(term).split(/[^a-zа-яё0-9]+/).filter(t=>t.length>3):[];
+const lfv=normalize(lv);
+if(term&&(isPositive(lv)||tt.some(t=>lfv.includes(t))))return{entry:{label:"Упоминание в тексте",value:`Найдено: ${term}`,sourceUrl:ofc.url},localMeta:lm,kind:"feature"};
+return null;
+}
+function compareReference(lv,lt,ref){
+if(ref.kind==="zone"){
+const ln=numbersOf(lv),d=numberOf(ref.entry.diameter.value),p=numberOf(ref.entry.power.value);
+const lk=normalize(lt),lf=/см/.test(lk)?10:1,lpf=/квт/.test(lk)?1000:1;
+const ou1=unitsForLabel(ref.entry.diameter.label,ref.entry.diameter.value),ou2=unitsForLabel(ref.entry.power.label,ref.entry.power.value);
+return ln.length>=2&&d!==null&&p!==null?Math.abs(ln[0]*lf-d*ou1.factor)<=1.5&&Math.abs(ln[1]*lpf-p*ou2.factor)<=10:null;
+}
+if(ref.kind==="feature"||ref.kind==="feature-gallery"){if(isPositive(lv))return true;if(isNegative(lv))return false;if(ref.kind==="feature-gallery")return true;return compareText(lv,ref.entry.value);}
+return compareWithEntry(lv,lt,ref.entry,ref.localMeta);
+}
+
+async function loadOfficialProduct(p){
+try{const f=await findOfficialUrl(p);if(!f)return{error:"модель не найдена",model:modelCandidates(p)[0]||""};if(!officialCache.has(f.url))officialCache.set(f.url,requestHtml(f.url).then(h=>parseOfficialPage(h,f.url)));const r=await officialCache.get(f.url);return{...r,model:f.model};}catch(e){return{error:String(e.message||e),model:modelCandidates(p)[0]||""};}
+}
+async function runOfficialValidation(rows,products,apiKey){
+const result=emptyResult();
+const records=await Promise.all(products.map(p=>loadOfficialProduct(p)));
+const summary={records,checked:0,confirmed:0,mismatches:0,unknown:0,skipped:0,failed:0,aiConfirmed:0,modelUsed:""};
+records.forEach((r,i)=>{if(r.error)summary.failed+=1;if(r.url)products[i].officialUrl=r.url;});
+for(const row of rows){
+for(let i=0;i<row.values.length;i++){
+const lv=row.values[i],rec=records[i];summary.checked+=1;
+if(["article","ean","model"].includes(canonicalLabel(row.title))){summary.skipped+=1;continue;}
+if(!rec||rec.error){summary.unknown+=1;noteResult(result,row,i,"warning",`⚠️ ОФИЦИАЛЬНЫЙ ИСТОЧНИК: ${row.title} не проверен для ${productLabel(products,i)} (${rec?.error||"нет записи"})`,"Не найдено на оф. сайте",rec?.url||"",true,{label:"Официальный источник",value:rec?.error||"Карточка не найдена",source:rec?.url||"",anchorLabel:""});continue;}
+let ref=findReference(row.title,lv,rec);
+if(!ref&&!isMissing(lv)&&apiKey){
+const mn=products[i]?.model||rec?.model||"";
+if(mn){try{const ai=await findEvidence(products[i],row.title,lv,apiKey);if(ai.modelUsed)summary.modelUsed=ai.modelUsed;if(ai.status==="ok"||ai.sources.length){ref={entry:{label:`AI: ${row.title}`,value:ai.answer||"найдено через Gemini",sourceUrl:ai.sources[0]?.url||""},localMeta:null,kind:"ai-search"};}}catch(e){console.warn("[GCV] AI fail:",e);}}
+}
+if(!ref){summary.unknown+=1;noteResult(result,row,i,"warning",`⚠️ ОФИЦИАЛЬНЫЙ ИСТОЧНИК: характеристика «${row.title}» не найдена у ${productLabel(products,i)}`,"Нет на оф. сайте",rec.url,true,{label:row.title,value:"Поле не найдено на официальном сайте",source:rec.url,anchorLabel:row.title});continue;}
+const cmp=compareReference(lv,row.title,ref);
+const st=cmp===null?"warning":cmp?"ok":"error";
+if(st==="ok"){summary.confirmed+=1;if(ref.kind==="ai-search")summary.aiConfirmed+=1;}
+if(st==="error")summary.mismatches+=1;
+if(st==="warning")summary.unknown+=1;
+const pr=st==="ok"?"✅":st==="error"?"❌":"⚠️";
+const mk=ref.kind==="fuzzy"?" [FUZZY]":ref.kind==="ai-search"?" [AI]":"";
+const msg=`${pr} ОФИЦИАЛЬНЫЙ ИСТОЧНИК${mk}: «${row.title}» → «${ref.entry.label}» у ${productLabel(products,i)}; локально «${lv||"пусто"}», официально «${formatOfficialValue(ref.entry.value,row.title)||"пусто"}»`;
+const tt=st==="error"?`На оф. сайте: ${formatOfficialValue(ref.entry.value,row.title)}`:(st==="warning"?"Нет на оф. сайте":"");
+noteResult(result,row,i,st,msg,tt,ref.entry.sourceUrl||rec.url,true,{label:ref.entry.label,value:formatOfficialValue(ref.entry.value,row.title)||"пусто",source:ref.entry.sourceUrl||rec.url,anchorLabel:ref.entry.anchorLabel||ref.entry.label});
+}
+}
+records.forEach((r,i)=>{if(!r||r.error||!r.featureNames?.length)return;r.featureNames.forEach(fn=>{const lm=rows.some(row=>featureNameMatches(row.title,row.values[i]||"",fn));if(!lm)result.findings.push(`⚠️ ОФИЦИАЛЬНАЯ ФУНКЦИЯ: «${fn}» есть у ${productLabel(products,i)}, но локального поля для сравнения нет`);});});
+result.officialSummary=summary;return result;
+}
+function mergeResults(t,e){
+e.rowResults.forEach((i,row)=>{const p=t.rowResults.get(row)||{status:"ok",messages:new Set(),tooltips:new Set(),details:[]};if(STATUS_RANK[i.status]>STATUS_RANK[p.status])p.status=i.status;i.messages.forEach(m=>p.messages.add(m));if(i.tooltips)i.tooltips.forEach(x=>p.tooltips.add(x));(i.details||[]).forEach(d=>addDetail(p,d));t.rowResults.set(row,p);});
+e.cellResults.forEach((i,cell)=>{const p=t.cellResults.get(cell)||{status:"ok",messages:new Set(),tooltips:new Set(),sources:new Set(),details:[]};if(STATUS_RANK[i.status]>STATUS_RANK[p.status])p.status=i.status;i.messages.forEach(m=>p.messages.add(m));if(i.tooltips)i.tooltips.forEach(x=>p.tooltips.add(x));(i.sources||[]).forEach(s=>p.sources.add(s));(i.details||[]).forEach(d=>addDetail(p,d));t.cellResults.set(cell,p);});
+t.findings.push(...e.findings);t.officialSummary=e.officialSummary;
+}
+
+function closePopover(){if(!openPopover)return;openPopover.element.remove();openPopover=null;}
+function copyValue(v,b){const t=String(v??"");(async()=>{try{await navigator.clipboard.writeText(t);}catch(_){const ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);ta.select();document.execCommand("copy");ta.remove();}const o=b.textContent;b.textContent="Скопировано";window.setTimeout(()=>{b.textContent=o;},1200);})();}
+function ensurePopoverListeners(){if(popoverListenersReady)return;popoverListenersReady=true;document.addEventListener("click",e=>{if(!openPopover)return;if(e.target.closest(".gcv-popover,.gcv-info-button"))return;closePopover();});window.addEventListener("resize",closePopover);window.addEventListener("scroll",closePopover,true);}
+function showPopover(cell,item,btn){
+ensurePopoverListeners();closePopover();
+const p=document.createElement("div");p.className="gcv-popover";p.setAttribute("role","dialog");
+const h=document.createElement("div");h.className="gcv-popover-head";
+const t=document.createElement("strong");t.textContent=item.status==="error"?"Расхождение":"Подробности проверки";
+const c=document.createElement("button");c.type="button";c.className="gcv-popover-close";c.textContent="×";c.addEventListener("click",closePopover);
+h.append(t,c);p.appendChild(h);
+const ds=item.details||[];
+if(ds.length){ds.forEach(d=>{const r=document.createElement("div");r.className="gcv-popover-row";const v=document.createElement("span");v.textContent=`${d.label?`${d.label}: `:""}${d.value||"пусто"}`;r.appendChild(v);if(item.status==="error"&&d.value){const cb=document.createElement("button");cb.type="button";cb.className="gcv-popover-copy";cb.textContent="Копировать";cb.addEventListener("click",()=>copyValue(d.value,cb));r.appendChild(cb);}p.appendChild(r);});}
+else Array.from(item.messages||[]).forEach(m=>{const r=document.createElement("div");r.className="gcv-popover-message";r.textContent=m;p.appendChild(r);});
+const srcs=new Set(ds.map(d=>d.source).filter(Boolean));(item.sources||new Set()).forEach(s=>srcs.add(s));
+const src=srcs.values().next().value;
+if(src){const a=document.createElement("a");const sd=ds.find(d=>d.source);a.href=officialAnchorUrl(src,sd?.anchorLabel||sd?.label||"");a.target="_blank";a.rel="noreferrer";a.textContent="Перейти к параметру";a.className="gcv-popover-source";p.appendChild(a);}
+document.body.appendChild(p);
+const br=btn.getBoundingClientRect(),pr=p.getBoundingClientRect();
+const l=Math.min(Math.max(8,br.left),window.innerWidth-pr.width-8);
+const bel=br.bottom+8;const tp=bel+pr.height<=window.innerHeight-8?bel:Math.max(8,br.top-pr.height-8);
+p.style.left=`${l}px`;p.style.top=`${tp}px`;
+openPopover={element:p,button:btn};
+}
+function removeAnnotations(){closePopover();document.querySelectorAll(".gcv-badge,.gcv-source,.gcv-cell-source,.gcv-info-button,.gcv-edit-card").forEach(i=>i.remove());document.querySelectorAll(ROW_SELECTOR).forEach(r=>r.classList.remove("gcv-row-error","gcv-row-warning","gcv-row-ok"));}
+function renderResults(r,ps){
+removeAnnotations();
+r.rowResults.forEach((i,row)=>row.element.classList.add(`gcv-row-${i.status}`));
+r.cellResults.forEach((i,cell)=>{
+if(!cell)return;
+const b=document.createElement("span");b.className=`gcv-badge gcv-badge-${i.status}`;b.textContent=i.status==="error"?"❌":i.status==="warning"?"⚠️":"✅";
+b.style.cssText="margin-left:8px;font-size:14px;";cell.append(" ",b);
+if(i.sources.size>0){const u=i.sources.values().next().value;const d=(i.details||[]).find(e=>e.source);const a=document.createElement("a");a.className="gcv-cell-source";a.href=officialAnchorUrl(u,d?.anchorLabel||d?.label||"");a.target="_blank";a.rel="noreferrer";a.textContent="↗";a.title=d?.anchorLabel||d?.label?"Перейти к параметру на официальном сайте":`Открыть источник: ${u}`;a.style.cssText="margin-left:4px;text-decoration:none;color:#007f83;";cell.append(" ",a);}
+if((i.details||[]).length||i.messages?.size){const inf=document.createElement("button");inf.type="button";inf.className="gcv-info-button";inf.textContent="ℹ";inf.addEventListener("click",()=>{if(openPopover?.button===inf)closePopover();else showPopover(cell,i,inf);});cell.append(" ",inf);}
+if(i.status!=="ok"&&i.productIndex!=null&&ps[i.productIndex]){const hr=editUrl(ps[i.productIndex],i.rowTitle);if(hr){const a=document.createElement("a");a.className="gcv-cell-source";a.href=hr;a.target="_blank";a.rel="noreferrer";a.textContent="✏️";a.title=`Открыть админку на поле «${i.rowTitle}»`;cell.append(" ",a);}}
+});
+}
+
+function ensurePanel(){
+let p=document.getElementById(PANEL_ID);if(p)return p;
+const s=document.createElement("style");
+s.textContent=`#${PANEL_ID}{position:fixed;z-index:2147483646;top:14px;right:14px;width:min(430px,calc(100vw - 28px));max-height:calc(100vh - 28px);overflow:auto;background:#fff;color:#17212b;border:1px solid #cfd8dc;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.2);font:14px/1.4 Arial,sans-serif} #${PANEL_ID} .gcv-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 14px;background:#f1f5f6;border-bottom:1px solid #dfe7e9} #${PANEL_ID} .gcv-title{font-weight:700} #${PANEL_ID} .gcv-body{padding:12px 14px} #${PANEL_ID} button{border:1px solid #aebdc2;border-radius:6px;background:#fff;padding:6px 9px;cursor:pointer} #${PANEL_ID} button:hover{background:#eaf5f5} #${PANEL_ID} .gcv-run{background:#007f83;color:#fff;border-color:#007f83} #${PANEL_ID} .gcv-summary{margin:0 0 9px;font-weight:700} #${PANEL_ID} .gcv-note{color:#526168;font-size:12px;margin:8px 0} #${PANEL_ID} .gcv-list{margin:8px 0 0;padding-left:20px;max-height:360px;overflow:auto} #${PANEL_ID} .gcv-list li{margin:0 0 7px} #${PANEL_ID} a{color:#007f83} .gcv-info-button{margin-left:5px;padding:1px 5px!important;border:1px solid #aebdc2;border-radius:4px;background:#fff;color:#007f83;font-size:13px;line-height:1.2;cursor:pointer} .gcv-info-button:hover{background:#eaf5f5}.gcv-popover{position:fixed;z-index:2147483647;width:min(390px,calc(100vw - 16px));max-height:min(70vh,520px);overflow:auto;padding:0;background:#fff;color:#17212b;border:1px solid #aebdc2;border-radius:8px;box-shadow:0 8px 26px rgba(0,0,0,.24);font:13px/1.4 Arial,sans-serif} .gcv-popover-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 11px;background:#f1f5f6;border-bottom:1px solid #dfe7e9}.gcv-popover-close{border:0!important;background:transparent!important;padding:0 3px!important;font-size:20px;line-height:1;color:#526168;cursor:pointer}.gcv-popover-row{display:flex;align-items:flex-start;gap:8px;padding:9px 11px;border-bottom:1px solid #edf1f2}.gcv-popover-row>span{flex:1;min-width:0;word-break:break-word}.gcv-popover-message{padding:9px 11px;white-space:pre-wrap;word-break:break-word}.gcv-popover-copy{padding:4px 7px!important;font-size:11px;line-height:1.2;white-space:nowrap}.gcv-popover-source{display:block;padding:9px 11px;color:#007f83} #${PANEL_ID}.gcv-collapsed .gcv-body{display:none} #${PANEL_ID}.gcv-collapsed{width:auto} .gcv-row-error .compare-table-block__cell,.gcv-row-error .characteristics__property{background-color:rgba(255,72,72,.12)!important} .gcv-row-warning .compare-table-block__cell,.gcv-row-warning .characteristics__property{background-color:rgba(255,193,7,.13)!important} .gcv-row-ok .compare-table-block__cell,.gcv-row-ok .characteristics__property{background-color:rgba(57,181,74,.08)!important}`;
+document.head.appendChild(s);
+p=document.createElement("section");p.id=PANEL_ID;
+p.innerHTML=`<div class="gcv-head"><span class="gcv-title">Расширенная проверка v1.4.0</span><button data-action="toggle">Скрыть</button></div><div class="gcv-body"><div style="margin-bottom:8px;"><input data-action="key" type="password" placeholder="Gemini API key (опционально)" style="width:100%;padding:6px 8px;border:1px solid #aebdc2;border-radius:6px;box-sizing:border-box;"></div><button class="gcv-run" data-action="run">Проверить ещё раз</button><div class="gcv-output">Таблица загружается…</div></div>`;
+p.querySelector('[data-action="run"]').addEventListener("click",()=>runChecks());
+p.querySelector('[data-action="toggle"]').addEventListener("click",e=>{p.classList.toggle("gcv-collapsed");e.currentTarget.textContent=p.classList.contains("gcv-collapsed")?"Показать":"Скрыть";});
+document.body.appendChild(p);return p;
+}
+function renderPanel(r,ps,loading=false){
+const p=ensurePanel(),o=p.querySelector(".gcv-output");
+const errs=[...r.rowResults.values()].filter(i=>i.status==="error").length;
+const warns=[...r.rowResults.values()].filter(i=>i.status==="warning").length;
+o.replaceChildren();
+const sm=document.createElement("p");sm.className="gcv-summary";sm.textContent=`Ошибок: ${errs}. Предупреждений: ${warns}. Проверенных строк: ${r.rowResults.size}.`;o.appendChild(sm);
+if(loading){const n=document.createElement("p");n.className="gcv-note";n.textContent="Загружаю официальные карточки ru.gorenje.com и сверяю характеристики…";o.appendChild(n);return;}
+if(r.officialSummary){const of=document.createElement("p");of.className="gcv-note";const i=r.officialSummary;of.textContent=`Официальная проверка: подтверждено ${i.confirmed} (AI: ${i.aiConfirmed||0}), расхождений ${i.mismatches}, нет подтверждения ${i.unknown}, пропущено ${i.skipped||0}.${i.modelUsed?` Модель: ${i.modelUsed}`:""}`;o.appendChild(of);}
+const fs=[...new Set(r.findings)];
+if(!fs.length){const ok=document.createElement("p");ok.textContent="✅ Ошибок по доступным правилам не найдено.";o.appendChild(ok);return;}
+const l=document.createElement("ul");l.className="gcv-list";fs.forEach(m=>{const i=document.createElement("li");i.textContent=m;l.appendChild(i);});o.appendChild(l);
+}
+
+async function waitForStableTable(){let pc=0,sp=0;for(let a=0;a<14;a+=1){const c=readTable().length;if(c>0&&c===pc)sp+=1;else sp=0;if(sp>=2)return;pc=c;await new Promise(r=>window.setTimeout(r,500));}}
+async function runChecks(){
+if(runInProgress)return;runInProgress=true;
+await waitForStableTable();
+const rows=readTable();
+if(rows.length<1){renderPanel({...emptyResult(),findings:[`Таблица не найдена: ${window.location.href}`]},[], false);runInProgress=false;return;}
+const cr=++runSequence;hasRun=true;
+const ps=readProducts(rows);
+const ep=Promise.all(ps.map(p=>fetchEditBaseUrl(p).then(u=>{p.editBase=u;})));
+const lr=runLocalValidation(rows,ps);
+renderResults(lr,ps);renderPanel(lr,ps,true);
+const apiKey=document.querySelector(`#${PANEL_ID} [data-action="key"]`)?.value.trim()||"";
+try{const or=await runOfficialValidation(rows,ps,apiKey);if(cr!==runSequence)return;mergeResults(lr,or);}catch(e){console.error("[GCV] err:",e);lr.findings.push(`⚠️ Внутренняя ошибка: ${e?.message||e}`);}
+await ep;if(cr!==runSequence)return;
+renderResults(lr,ps);renderProductEditLinks(ps);
+if(pageMode()==="product")patchCardEditButton(lr,rows);
+renderPanel(lr,ps,false);runInProgress=false;
+}
+function start(){
+if(hasStarted)return;hasStarted=true;ensurePanel();
+const obs=new MutationObserver(()=>{if(hasRun||runInProgress||document.querySelectorAll(ROW_SELECTOR).length<1)return;window.clearTimeout(autoTimer);autoTimer=window.setTimeout(()=>runChecks(),1000);});
+obs.observe(document.body,{childList:true,subtree:true});
+autoTimer=window.setTimeout(()=>runChecks(),1500);
+}
+
+if(isAdminPage()){if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",initAdminHighlight,{once:true});else initAdminHighlight();}
+else if(isOfficialProductPage()){if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",focusOfficialField,{once:true});else focusOfficialField();}
+else if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",start,{once:true});}
+else{start();window.addEventListener("load",start,{once:true});}
+})();
