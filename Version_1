@@ -1,247 +1,2377 @@
 // ==UserScript==
 // @name         Gorenje: расширенная проверка сравнения (v1.3.0)
 // @namespace    https://gorenje-ru.ru/
-// @version      1.3.0
-// @description  Локальная сверка карточек Gorenje с Битрикс-интеграцией
+// @version      1.4.0
+// @description  Сверка Gorenje с официальным сайтом, PDF и резервным веб-поиском по сниппетам.
+// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js
 // @match        https://gorenje-ru.ru/compare/*
 // @match        https://gorenje-ru.ru/catalog/*.html
 // @match        https://gorenje-ru.ru/catalog/*/*.html
 // @match        https://gorenje-ru.ru/catalog/*/*/*.html
 // @match        https://gorenje-ru.ru/catalog/*/*/*/*.html
 // @match        https://gorenje-ru.ru/bitrix/admin/iblock_element_edit.php*
+// @match        https://ru.gorenje.com/products/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
-// @grant        GM.xmlHttpRequest
+// @connect      ru.gorenje.com
 // @connect      gorenje-ru.ru
+// @connect      html.duckduckgo.com
+// @connect      www.bing.com
+// @connect      bing.com
 // ==/UserScript==
+
 (function () {
-"use strict";
-const ROW_SELECTOR = ".compare-table-block__row.js-compare-row, .characteristics__row";
-const PANEL_ID = "gcv-panel";
-const STATUS_RANK = { ok: 0, warning: 1, error: 2 };
-const BITRIX_IBLOCK_ID = 1099;
-let hasRun = false, hasStarted = false, runInProgress = false, runSequence = 0, autoTimer = null;
-const editUrlCache = new Map();
-let openPopover = null, popoverListenersReady = false;
+  "use strict";
 
-function normalize(v){return String(v??"").normalize("NFKC").replace(/\u00a0/g," ").replace(/[\u200B-\u200D\uFEFF]/g,"").replace(/(\d),(\d)/g,"$1.$2").replace(/×/g,"x").replace(/(\d)\s*[хХ]\s*(?=\d)/g,"$1 x ");}
-function normalizeLabel(v){return normalize(v).replace(/\s+источник\s*$/,"").replace(/\s*\*+\s*$/,"");}
-function sourceUrl(){return window.location.href;}
-function isProductPage(){return window.location.pathname.includes('/catalog/');}
-function pageMode(){return isProductPage()?"product":"compare";}
-function isAdminPage(){return window.location.pathname.includes("/bitrix/admin/iblock_element_edit.php");}
+  const ROW_SELECTOR = ".compare-table-block__row.js-compare-row, .characteristics__row";
+  const PANEL_ID = "gcv-panel";
+  const OFFICIAL_ORIGIN = "https://ru.gorenje.com";
+  const STATUS_RANK = { ok: 0, warning: 1, error: 2 };
 
-function numbersOf(v){return(normalize(v).match(/\d+(?:\.\d+)?/g)||[]).map(Number);}
-function numberOf(v){const n=numbersOf(v);return n.length?n[0]:null;}
-function isMissing(v){const k=normalize(v).replace(/[\u2020*]+/g,"").trim();return!k||/^(?:не указано|неизвестно|[-—–])$/.test(k);}
-function isNegative(v){const k=normalize(v);return/^(?:нет|no|[-—–]|false|отсутствует)$/.test(k)||k==="0";}
-function isPositive(v){const k=normalize(v);return/^(?:да|есть|\+|yes|true|имеется|присутствует)$/.test(k)||k==="1";}
-function booleanKey(v){const k=normalize(v);if(/^(?:да|есть|\+|yes|true|имеется|присутствует)$/.test(k)||k==="1")return"yes";if(/^(?:нет|no|-|false|отсутствует)$/.test(k)||k==="0")return"no";return null;}
+  function normalize(value) {
+    return String(value ?? "")
+      .normalize("NFKC")
+      .replace(/\u00a0/g, " ")
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/(\d),(\d)/g, "$1.$2")
+      .replace(/×/g, "x")
+      .replace(/(\d)\s*[хХ]\s*(?=\d)/g, "$1 x ")
+      .replace(/ё/g, "е")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+  }
 
-function unitInfo(v){
-const k=normalize(v);
-if(/(?:^|[\s,(])(?:квтч|квт\/ч|kwh)(?:$|[\s,.)])/.test(k))return{group:"energy",factor:1,name:"кВт·ч"};
-if(/(?:^|[\s,(])квт(?:$|[\s,.)])/.test(k))return{group:"power",factor:1000,name:"кВт"};
-if(/(?:^|[\s,(])вт(?:$|[\s,.)])/.test(k))return{group:"power",factor:1,name:"Вт"};
-if(/(?:^|[\s,(])мм(?:$|[\s,.)])/.test(k))return{group:"length",factor:1,name:"мм"};
-if(/(?:^|[\s,(])см(?:$|[\s,.)])/.test(k))return{group:"length",factor:10,name:"см"};
-if(/(?:^|[\s,(])кг(?:$|[\s,.)])/.test(k))return{group:"weight",factor:1,name:"кг"};
-if(/(?:^|[\s,(])л(?:$|[\s,.)])/.test(k))return{group:"volume",factor:1,name:"л"};
-if(/(?:°c|градус)/.test(k))return{group:"temperature",factor:1,name:"°C"};
-if(/(?:об\s*\/\s*мин|об\s+мин)/.test(k))return{group:"speed",factor:1,name:"об/мин"};
-return null;
-}
-function unitsForLabel(l,v){return unitInfo(l)||unitInfo(v)||{group:"number",factor:1,name:""};}
+  function normalizeLabel(value) {
+    return normalize(value)
+      .replace(/\s+источник\s*$/, "")
+      .replace(/\s*\*+\s*$/, "")
+      .replace(/([вшг])х(?=[вшг])/g, "$1 x ")
+      .replace(/[()[\],:;.!?—–\-/«»"']/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
 
-function valuesEqual(f,s){
-const lb=booleanKey(f),rb=booleanKey(s);if(lb&&rb)return lb===rb;
-const su=v=>normalize(v).replace(/[\u2020*]+/g,"").replace(/(?:квтч|квт\/ч|квт|вт|см|мм|кг|°c|°|градусов|кwh|kwh)/g," ").replace(/\s+/g," ").trim();
-const l=su(f),r=su(s);if(!l||!r)return l===r;
-if(l===r||l.includes(r)||r.includes(l))return true;
-const ln=numbersOf(l),rn=numbersOf(r);
-if(ln.length>0&&ln.length===rn.length&&(ln.every((n,i)=>Math.abs(n-rn[i])<0.01)||ln.slice().sort((a,b)=>a-b).every((n,i)=>Math.abs(n-rn.slice().sort((a,b)=>a-b)[i])<0.01)))return true;
-const lk=v=>normalize(v).replace(/климатический класс|температурные режимы/g," ").split(/[^a-zа-яё0-9]+/).filter(Boolean).sort().join(" ");
-if(/климатический класс/.test(l+r)&&lk(l)===lk(r))return true;
-return false;
-}
+  // ==========================================
+  // 1. МАППИНГ ПОЛЕЙ (ключи в читаемом виде, нормализуются автоматически)
+  // ==========================================
+  const FIELD_MAPPING_RAW = {
+    "Тип": [],
+    "Тип плиты": [/^(?:категория|тип прибора)$/],
+    "Тип варочной поверхности": [/^тип варочной поверхности/],
+    "Тип духового шкафа": [/^тип духового шкафа/, /^тип духовки/],
+    "Способ подключения": [/^тип питания/, /^источник энергии/, /^способ подключения/],
+    "Объем рабочей камеры, л": [/^полезный объем/],
+    "Объем духовки, л": [/^полезный объем/],
+    "Габаритные размеры (ВxШxГ), см": [/^размеры \(ш×в×г\)/, /^габаритные размеры/],
+    "Габаритные размеры ВхШхГ, см": [/^размеры \(ш×в×г\)/, /^габаритные размеры/],
+    "Размеры ниши для встраивания (ВxШxГ), см": [/^мин\.\s*размеры ниши/, /ниши для встраивания/, /^размеры ниши/],
+    "Размеры в упаковке (ВxШxГ), см": [/^размеры в упаковке/],
+    "Размеры в упаковке ВхШхГ, см": [/^размеры в упаковке/],
+    "Высота, см": [/^высота мм$/, /^высота$/],
+    "Ширина, см": [/^ширина мм$/, /^ширина$/],
+    "Глубина, см": [/^глубина мм$/, /^глубина$/],
+    "Высота упаковки, см": [/^высота в упаковке/, /^высота упаковки/],
+    "Ширина упаковки, см": [/^ширина в упаковке/, /^ширина упаковки/],
+    "Глубина упаковки, см": [/^глубина в упаковке/, /^глубина упаковки/],
+    "Материал панели управления": [/^материал панели управления/],
+    "Материал варочной поверхности": [/^(?:материал|покрытие) варочной (?:поверхности|панели)$/],
+    "Материал крышки варочной поверхности": [/^крышка/],
+    "Материал дверцы": [/^материал дверцы/],
+    "Цвет": [/^цвет$/],
+    "Цвет фурнитуры": [/^цвет ручки/],
+    "Цвет ручки дверцы": [/^цвет ручки/],
+    "Шарнир дверцы": [/^шарнир дверцы/],
+    "Покрытие против отпечатков пальцев": [/^защита от отпечатков/, /^fingerprint/],
+    "Внутреннее покрытие духовки": [/^покрытие стенок рабочей камеры/, /^покрытие камеры/, /^эмаль/, /^пиролитическая/],
+    "Освещение духовки": [/^освещение духовки/, /^освещение/],
+    "Внутреннее освещение": [/^освещение духовки/, /^освещение/],
+    "Дизайн": [/^дизайн/, /^линейка/, /^серия/],
+    "Управление": [/^тип управления/],
+    "Тип управления": [/^тип управления/],
+    "Программатор": [/^программатор/],
+    "Таймер": [/^программатор/, /^таймер/],
+    "Тип переключателей": [],
+    "Форма переключателей": [/^форма переключателей/],
+    "Класс энергопотребления": [/^класс энергопотребления/],
+    "Присоединительная мощность, кВт": [/^присоединительная мощность/, /^мощность подключения/],
+    "Присоединительная мощность — эл., кВт": [/^присоединительная мощность/, /^мощность подключения/],
+    "Максимальная температура, °С": [/^максимальная температура/],
+    "Энергопотребление (классический нагрев), кВт/ч": [/^потребление электроэнергии/],
+    "Потребление электроэнергии вентиляционный нагрев, кВт": [/^потребление электроэнергии/],
+    "Вес без упаковки, кг": [/^вес нетто/],
+    "Вес нетто, кг": [/^вес нетто/],
+    "Вес брутто, кг": [/^вес брутто/],
+    "Артикул": [/^артикул$/],
+    "Страна-производитель": [/^страна производства/],
+    "Гарантия": [/^гарантия/],
+    "Система охлаждения": [/^система охлаждения/, /^динамическая система/, /^no ?frost$/],
+    "Термоэлектрический предохранитель": [/^термоэлектрический предохранитель/],
+    "Дверца": [/^дверца духовки/, /^дверца/],
+    "Съемный стеклопакет": [/^съемный стеклопакет/, /^внутренняя поверхность дверцы/],
+    "Количество стекол": [/^застекление дверцы/, /^количество стекол/],
+    "Количество стекол, шт": [/^застекление дверцы/, /^количество стекол/],
+    "Количество теплоотражающих слоев": [/термослой/, /^теплоотражающ/],
+    "Количество теплоотражающих слоев, шт": [/термослой/, /^теплоотражающ/],
+    "Решетка": [/^решетка/],
+    "Мелкий противень, шт": [/^мелкий противень/],
+    "Глубокий противень": [/^глубокий противень/, /^универсальный противень/],
+    "Глубокий эмалированный противень": [/^глубокий противень/, /^1 глубокий/],
+    "Рельефные направляющие": [/^рельефные направляющие/, /^направляющие/],
+    "Тип ящика": [/^ящик плиты/],
+    "Часы": [/^часы/],
+    "Будильник": [/^будильник/],
+    "Звуковой сигнал": [/^звуковой сигнал/],
+    "Автопрограммы": [/^автопрограммы/],
+    "Тип очистки": [/^очистка/, /^aquaclean/, /^тип очистки/, /^каталитическая/],
+    "Очистка от накипи": [/^очистка от накипи/],
+    "Индикация остаточного тепла для каждой конфорки": [/^индикация остаточного тепла/, /^индикатор остаточного тепла/],
+    "Количество режимов": [/^количество программ/],
+    "Количество функций духовки": [/^количество программ/],
+    "Конфорки": [/^количество конфорок/],
+    "Передняя левая, кВт": [/^мощность передней левой/],
+    "Передняя правая, кВт": [/^мощность передней правой/],
+    "Задняя левая, кВт": [/^мощность задней левой/],
+    "Задняя правая, кВт": [/^мощность задней правой/],
+    "Передняя левая, мм": [/^ø\s*передняя левая/],
+    "Передняя правая, мм": [/^ø\s*передняя правая/],
+    "Задняя левая, мм": [/^ø\s*задняя левая/],
+    "Задняя правая, мм": [/^ø\s*задняя правая/],
 
-function compareNumberPart(lv,ov,lu,ou){
-const l=numbersOf(lv).map(n=>n*(lu?.factor||1)),o=numbersOf(ov).map(n=>n*(ou?.factor||1));
-if(!l.length||!o.length)return null;
-if(lu?.group&&ou?.group&&lu.group!==ou.group)return false;
-if(l.length===o.length)return l.every((n,i)=>Math.abs(n-o[i])<0.01);
-if(l.length===1&&o.length>1)return l[0]>=Math.min(...o)-0.01&&l[0]<=Math.max(...o)+0.01;
-if(o.length===1&&l.length>1)return o[0]>=Math.min(...l)-0.01&&o[0]<=Math.max(...l)+0.01;
-return false;
-}
+    // Названия ниже встречаются у холодильников, стирки, посудомоек и малой техники.
+    "Объем, л": [/^объем(?: л)?$/, /^объем нетто(?: л)?$/],
+    "Общий объем, л": [/^общий объем(?: брутто)?(?: л)?$/],
+    "Полезный объем": [/^(?:полезный объем|объем нетто)(?: л)?$/],
+    "Объем нетто, л": [/^(?:полезный объем|объем нетто)(?: л)?$/],
+    "Объем холодильного отделения, л": [/^объем (?:нетто )?(?:холодильного отделения|х о)(?: л)?$/],
+    "Объем морозильного отделения, л": [/^объем (?:нетто )?(?:морозильного отделения|м о)(?: л)?$/],
+    "Объем барабана, л": [/^объем барабана(?: л)?$/],
+    "Максимальная загрузка (хлопок), кг": [/^(?:максимальная )?загрузка(?: кг)?$/],
+    "Максимальное количество оборотов отжима, об./мин.": [/^(?:максимальное количество оборотов отжима|отжим)(?: об мин)?$/],
+    "Способ открывания дверцы": [/^(?:способ )?(?:открытие|открывание) дверцы/],
+    "Дверца открывается": [/^(?:способ )?(?:открытие|открывание) дверцы/],
+    "Открывание дверцы": [/^(?:открытие|открывание) дверцы/],
+    "Очистка паром": [/^(?:очистка паром|очистка aquaclean|очистка aqua clean)/],
+    "Очистка": [/^очистка/, /^aquaclean/, /^каталитическая/],
+    "Система интенсивной циркуляции воздуха (multi flow 360)": [/^(?:циркуляция воздуха|система интенсивной циркуляции воздуха)/],
+    "Быстрое замораживание": [/^(?:включатель )?быстрое замораживание/],
+    "Эко": [/^режим эко$/, /^эко$/],
+    "Мощность микроволн": [/^мощность микроволн/],
+    "Стеклянная тарелка поворотного стола, мм": [/^диаметр тарелки/],
+    "Уровень мощности": [/^(?:уровни мощности|количество уровней мощности)/],
+    "Сенсор влажности белья": [/^сенсор влажности белья/],
+    "Защита от сминания (anti сrease)": [/^(?:защита от сминания|anticrease)/],
+    "Присоединительная мощность, Вт": [/^(?:мощность подключения|присоединительная мощность)/],
+    "Присоединительная мощность — эл., кВт": [/^(?:мощность подключения|присоединительная мощность)/],
+    "Потребление электроэнергии": [/^(?:потребление|расход) электроэнергии/],
+    "Расход электроэнергии": [/^(?:потребление|расход) электроэнергии/],
+    "Количество температурных зон": [/^количество температурных зон/],
+    "Вместимость бутылок по 0,75 л": [/^(?:вместимость бутылок|стандартные бутылки)/],
+  };
 
-function parseDimensionParts(v){return normalize(v).replace(/(?:см|мм)/g,"").split(/\s*x\s*/).map(p=>numbersOf(p));}
-function dimensionFormatIssues(v,title=""){
-const raw=String(v??"").trim(),issues=[];
-if(!/\d\s*[xх×]\s*\d/i.test(raw))return issues;
-const parts=raw.split(/\s*[xх×]\s*/i).filter(p=>/\d/.test(p));
-const isTriplet=parts.length>=3;
-const isDim=/размер|габарит|ниш|высот|ширин|глубин/i.test(String(title));
-if(!isTriplet&&!isDim)return issues;
-if(/(?:\d\s*x\s*\d|\d+x\d)/i.test(raw))issues.push("использована английская «x»; нужен русский разделитель «х»");
-else if(/\d\s*×\s*\d/.test(raw))issues.push("использован знак «×»; нужен русский разделитель «х»");
-return issues;
-}
+  const FIELD_MAPPING = {};
+  for (const [rawKey, patterns] of Object.entries(FIELD_MAPPING_RAW)) {
+    FIELD_MAPPING[normalizeLabel(rawKey)] = patterns;
+  }
 
-function textOf(e){if(!e)return"";const c=e.cloneNode(true);c.querySelectorAll(".glossary-tooltip,.gcv-badge,.gcv-source,.gcv-cell-source,.gcv-info-button,.gcv-edit-card").forEach(i=>i.remove());return String(c.innerText||c.textContent||"").replace(/\s+/g," ").trim();}
+  // Сайт магазина и официальный сайт используют разные подписи для одних и тех же полей.
+  // Канонические ключи применяются до нечёткого поиска, чтобы не принять соседнюю строку
+  // с общим словом «тип», «мощность» или «объём» за нужную характеристику.
+  const CANONICAL_LABEL_RULES = [
+    { key: "country", patterns: [/^страна (?:производитель|производства|изготовитель)$/] },
+    { key: "article", patterns: [/^(?:артикул|код товара)$/] },
+    { key: "ean", patterns: [/^(?:ean|еаn)(?: код)?$/] },
+    { key: "model", patterns: [/^модель$/] },
+    { key: "cooker-type", patterns: [/^тип плиты$/, /^категория$/, /^тип прибора$/] },
+    { key: "oven-type", patterns: [/^тип духового шкафа$/, /^тип духовки$/] },
+    { key: "connection-power", patterns: [/^(?:присоединительная мощность|мощность подключения)(?: эл)?$/] },
+    { key: "net-weight", patterns: [/^(?:вес нетто|масса нетто)$/] },
+    { key: "gross-weight", patterns: [/^(?:вес брутто|масса брутто)$/] },
+    { key: "usable-volume", patterns: [/^(?:полезный объем|объем нетто|объем рабочей камеры|объем духовки|объем духового шкафа)$/] },
+    { key: "total-volume", patterns: [/^(?:общий объем|общий объем брутто)$/] },
+    { key: "cooling-net-volume", patterns: [/^полезный объем холодильного отделения$/, /^объем нетто х о$/] },
+    { key: "cooling-gross-volume", patterns: [/^объем холодильного отделения$/, /^объем брутто х о$/] },
+    { key: "freezer-net-volume", patterns: [/^полезный объем морозильного отделения$/, /^объем нетто м о$/] },
+    { key: "freezer-gross-volume", patterns: [/^объем морозильного отделения$/, /^объем брутто м о$/] },
+     { key: "control", patterns: [/^(?:тип )?управлени[ея]$/] },
+    { key: "door-opening", patterns: [/^(?:способ )?(?:открытие|открывание) дверцы/] },
+    { key: "cavity-coating", patterns: [/^(?:внутреннее покрытие духовки|покрытие стенок рабочей камеры|покрытие внутренних стенок духовки и противней)$/] },
+    { key: "lighting", patterns: [/^(?:внутреннее )?освещение(?: духовки)?$/] },
+    { key: "steam-cleaning", patterns: [/^(?:очистка паром|очистка aquaclean|очистка aqua clean)$/] },
+    { key: "defrost", patterns: [/^размораживание(?: холодильного отделения| морозильного отделения)?$/] },
+    { key: "quick-freeze", patterns: [/^(?:быстрое замораживание|включатель быстрое замораживание)/] },
+    { key: "air-circulation", patterns: [/^(?:циркуляция воздуха|система интенсивной циркуляции воздуха)/] },
+    { key: "adapt-tech", patterns: [/^(?:adapttech|адаптивная технология охлаждения adapttech cooling)/] },
+    { key: "fresh-zone", patterns: [/^(?:зона свежести|контейнер зоны свежести)/] },
+    { key: "glass-shelves", patterns: [/^(?:стеклянные полки|количество стеклянных полок)/] },
+    { key: "door-shelves", patterns: [/^(?:дверные полки|количество дверных полок)/] },
+    { key: "freezing-capacity", patterns: [/^мощность замораживания/] },
+    { key: "steam-feature", patterns: [/^(?:обработка паром|функция пара|парогенератор steam ?tech)/] },
+    { key: "motor", patterns: [/^(?:мотор|инверторный мотор)/] },
+    { key: "homemade-shape", patterns: [/^(?:с|c)водчатая форма.*home ?made/] },
+    { key: "bottle-count", patterns: [/^(?:вместимость бутылок|стандартные бутылки)/] },
+    { key: "wooden-shelves", patterns: [/^(?:деревянные полки|деревянные полки в холодильной камере)/] },
+    { key: "capacity", patterns: [/^(?:вместимость|вместимость комплектов посуды)/] },
+    { key: "delay-start", patterns: [/^(?:отсрочка старта|отсрочка запуска|отсрочка окончания программы|установка окончания стирки)/] },
+    { key: "child-lock", patterns: [/^(?:блокировка от детей|блокировка панели управления|блокировка управления от детей)$/] },
+    { key: "water-cycle", patterns: [/^(?:расход воды за цикл|расход воды)$/] },
+    { key: "water-year", patterns: [/^(?:расход воды за год|годовое потребление воды)$/] },
+    { key: "energy-year", patterns: [/^(?:расход электроэнергии за год|расход электроэнергии в год|ориентировочное годовое потребление электроэнергии)$/] },
+    { key: "noise-wash", patterns: [/^уровень шума (?:при|во время) стирк/] },
+    { key: "noise-spin", patterns: [/^уровень шума (?:при|во время) отжима/] },
+    { key: "dishwasher-drying", patterns: [/^(?:тип сушки|сушка)/] },
+     { key: "height-adjustment", patterns: [/^регулировка высоты/] },
+    { key: "aqua-stop", patterns: [/^(?:полная защита от протечек|total aquastop)/] },
+    { key: "microwave-power", patterns: [/^мощность микроволн$/] },
+    { key: "plate-diameter", patterns: [/^(?:диаметр тарелки|стеклянная тарелка поворотного стола)$/] },
+    { key: "energy-class", patterns: [/^класс энергопотребления$/] },
+    { key: "load", patterns: [/^(?:максимальная )?загрузка(?: хлопок)?$/] },
+    { key: "spin-speed", patterns: [/^(?:максимальное количество оборотов отжима|отжим)$/] },
+    { key: "noise", patterns: [/^уровень шума$/] },
+    { key: "temperature-range", patterns: [/^(?:диапазон температур|температурные режимы)$/] },
+  ];
 
-function readTable(){
-const s=isProductPage()?".characteristics__row":".compare-table-block__row.js-compare-row";
-return[...document.querySelectorAll(s)].map(el=>{
-const te=el.querySelector(isProductPage()?".characteristics__name":".js-compare-cell-title");
-let vs=[];
-if(isProductPage())vs=[textOf(el.querySelector(".characteristics__property"))];
-else vs=[...el.querySelectorAll(".swiper-wrapper > .compare-table-block__cell.js-compare-cell")].map(textOf);
-return{element:el,title:textOf(te),titleElement:te,values:vs};
-}).filter(r=>r.title);
-}
-function rowCells(r){if(isProductPage())return[r.element.querySelector(".characteristics__property")];return[...r.element.querySelectorAll(".swiper-wrapper > .compare-table-block__cell.js-compare-cell")];}
-function findRow(rs,p){return rs.find(r=>p.test(normalizeLabel(r.title)));}
+  const MANUAL_COMMON_FIELDS = [
+    { label: "Габаритные размеры ВхШхГ, см", patterns: [/габаритн(?:ые|ых)?\s+размер/i, /размер(?:ы)?\s*\(?\s*[вw]\s*[xх×]\s*[шw]\s*[xх×]\s*г/i] },
+    { label: "Размеры в упаковке ВхШхГ, см", patterns: [/размер(?:ы)?\s+в\s+упаковке/i, /упаковк.*размер/i] },
+    { label: "Размеры ниши для встраивания (ВхШхГ), см", patterns: [/размер(?:ы)?\s+(?:ниши|для\s+встраивания)/i, /монтажн(?:ые|ых)\s+размер/i] },
+  ];
 
-function readProducts(rs){
-if(isProductPage()){const h1=document.querySelector('h1');const n=h1?h1.textContent.trim():document.title;const ar=findRow(rs,/^артикул/);const p={name:n,href:window.location.href,id:"",article:textOf(ar?.titleElement)};return[p];}
-const ar=findRow(rs,/^артикул/);
-return[...document.querySelectorAll(".comparison-card.swiper-slide")].map((c,i)=>{const t=c.querySelector(".comparison-card__type-and-title");const rb=c.querySelector(".js-compare_remove");const p={name:textOf(t),href:rb?.href||"",id:"",article:ar?textOf(ar.values[i]||""):"",editBase:""};return p;});
-}
-function productLabel(ps,i){const p=ps[i];if(!p)return`товар №${i+1}`;return p.name+(p.id?` (ID ${p.id})`:"");}
+  const CATEGORY_PROFILES = [
+    {
+      key: "refrigerator", label: "Холодильники", pattern: /холодиль|морозиль|kholodil|morozil|refrigerator|freezer/i,
+      fields: [
+        { label: "Объем холодильного отделения, л", patterns: [/объем.*холодильн.*отделен/i, /полезн.*объем.*холодильн/i] },
+        { label: "Объем морозильного отделения, л", patterns: [/объем.*морозильн.*отделен/i, /полезн.*объем.*морозильн/i] },
+        { label: "Общий объем, л", patterns: [/общ(?:ий|его)\s+объем/i] },
+        { label: "Мощность замораживания, кг/24ч", patterns: [/мощност.*замораж/i] },
+        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
+        { label: "Уровень шума, дБ", patterns: [/уровень\s+шума/i] },
+        { label: "Количество температурных зон", patterns: [/количество\s+температурн.*зон/i] },
+        { label: "Диапазон температур", patterns: [/диапазон\s+температур/i] },
+      ],
+    },
+    {
+      key: "washing", label: "Стиральные машины", pattern: /стиральн|washing|washer|stiral/i,
+      fields: [
+        { label: "Максимальная загрузка (хлопок), кг", patterns: [/максимальн.*загруз|загрузк.*хлопок/i] },
+        { label: "Максимальное количество оборотов отжима, об./мин.", patterns: [/оборот.*отжим|скорост.*отжим/i] },
+        { label: "Расход воды за цикл, л", patterns: [/расход\s+воды.*цикл/i] },
+        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
+        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
+        { label: "Количество программ", patterns: [/количество\s+программ/i] },
+        { label: "Мотор", patterns: [/инверторн.*мотор|тип\s+двигател/i] },
+        { label: "Сенсор влажности белья", patterns: [/сенсор.*влажност/i] },
+      ],
+    },
+    {
+      key: "dryer", label: "Сушильные машины", pattern: /сушильн|dryer|sushil/i,
+      fields: [
+        { label: "Максимальная загрузка (хлопок), кг", patterns: [/максимальн.*загруз|загрузк.*хлопок/i] },
+        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
+        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
+        { label: "Количество программ", patterns: [/количество\s+программ/i] },
+        { label: "Тепловой насос", patterns: [/теплов.*насос/i] },
+        { label: "Расход электроэнергии", patterns: [/расход.*электроэнерг|энергопотреблен/i] },
+      ],
+    },
+    {
+      key: "dishwasher", label: "Посудомоечные машины", pattern: /посудомоеч|dishwasher|posudomoech/i,
+      fields: [
+        { label: "Вместимость комплектов посуды", patterns: [/вместимость.*комплект|комплект.*посуд/i] },
+        { label: "Расход воды за цикл, л", patterns: [/расход\s+воды.*цикл/i] },
+        { label: "Количество программ", patterns: [/количество\s+программ/i] },
+        { label: "Тип сушки", patterns: [/тип\s+сушки|сушка/i] },
+        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
+        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
+        { label: "Полная защита от протечек", patterns: [/защит.*протеч|aquastop|аквастоп/i] },
+      ],
+    },
+    {
+      key: "microwave", label: "Микроволновые печи", pattern: /микроволнов|microwave|mikrovoln/i,
+      fields: [
+        { label: "Объем рабочей камеры, л", patterns: [/объем.*камер|вместимость.*камер/i] },
+        { label: "Мощность микроволн", patterns: [/мощность.*микроволн/i] },
+        { label: "Количество уровней мощности", patterns: [/уровн.*мощност/i] },
+        { label: "Диаметр тарелки", patterns: [/диаметр.*тарелк|поворотн.*стол/i] },
+        { label: "Гриль", patterns: [/мощность.*грил|наличие.*грил|гриль/i] },
+      ],
+    },
+    {
+      key: "oven", label: "Духовые шкафы", pattern: /духов|oven|духовк/i,
+      fields: [
+        { label: "Объем духовки, л", patterns: [/объем.*духов|объем.*рабоч.*камер/i] },
+        { label: "Количество функций духовки", patterns: [/количество.*функц|количество.*программ/i] },
+        { label: "Тип очистки", patterns: [/тип\s+очистк|очистк.*камер/i] },
+        { label: "Максимальная температура, °С", patterns: [/максимальн.*температур/i] },
+        { label: "Присоединительная мощность, кВт", patterns: [/присоединительн.*мощност|мощность.*подключ/i] },
+        { label: "Гриль", patterns: [/гриль/i] },
+        { label: "Очистка паром", patterns: [/очистк.*пар|steam/i] },
+      ],
+    },
+    {
+      key: "hob", label: "Варочные панели и плиты", pattern: /плит|варочн|cooktop|hob|plity|varochn/i,
+      fields: [
+        { label: "Количество конфорок", patterns: [/количество\s+конфорок|число\s+конфорок/i] },
+        { label: "Тип варочной поверхности", patterns: [/тип\s+варочн.*поверхност/i] },
+        { label: "Тип управления", patterns: [/тип\s+управлен|управление/i] },
+        { label: "Присоединительная мощность, кВт", patterns: [/присоединительн.*мощност|мощность.*подключ/i] },
+        { label: "Диаметр конфорок", patterns: [/диаметр.*конфор|размер.*конфор/i] },
+        { label: "Электроподжиг", patterns: [/электроподжиг/i] },
+        { label: "Газ-контроль", patterns: [/газ-контрол/i] },
+      ],
+    },
+    {
+      key: "wine", label: "Винные шкафы", pattern: /винн|wine/i,
+      fields: [
+        { label: "Вместимость бутылок по 0,75 л", patterns: [/вместимость.*бутыл|стандартн.*бутыл/i] },
+        { label: "Количество температурных зон", patterns: [/количество.*температурн.*зон/i] },
+        { label: "Диапазон температур", patterns: [/диапазон.*температур/i] },
+        { label: "Уровень шума", patterns: [/уровень\s+шума/i] },
+        { label: "Класс энергопотребления", patterns: [/класс.*энергопотреб/i] },
+      ],
+    },
+  ];
 
-async function fetchEditBaseUrl(p){
-const k=p.id||p.href;if(editUrlCache.has(k))return editUrlCache.get(k);
-let url="";const d=document.querySelector('a.ctrl-btn[href*="iblock_element_edit"]');
-if(pageMode()==="product"&&d)url=d.href;
-if(!url&&p.id)url=`https://gorenje-ru.ru/bitrix/admin/iblock_element_edit.php?IBLOCK_ID=${BITRIX_IBLOCK_ID}&type=gr_catalog&lang=ru&ID=${p.id}&find_section_section=-1&WF=Y`;
-editUrlCache.set(k,url);return url;
-}
-function editUrl(p,f){const b=p?.editBase||editUrlCache.get(p?.id||p?.href)||"";if(!b)return"";return b.split("#")[0]+(f?"#gcv="+encodeURIComponent(f):"");}
+  const GENERIC_CATEGORY_PROFILE = { key: "generic", label: "Общая техника", pattern: /.*/, fields: [] };
 
-function findAdminFieldRow(t){
-let best=null;document.querySelectorAll("td,th,label,span,b,div").forEach(el=>{
-if(el.children.length>2)return;const tx=normalizeLabel(el.textContent||"");
-if(!tx||tx.length>t.length+30)return;
-if(tx===t||tx.startsWith(t)||(t.startsWith(tx)&&tx.length>5)){if(!best||el.textContent.length<best.textContent.length)best=el;}
-});if(!best)return null;return best.closest("tr")||best.closest(".adm-detail-content-item")||best.parentElement;
-}
-function highlightAdminRow(r){
-const s=document.createElement("style");s.textContent=`.gcv-admin-target{outline:3px solid #ff6600!important;outline-offset:2px;background:#fff3e0!important;}.gcv-admin-target-input{outline:2px solid #ff6600!important;}`;
-document.head.appendChild(s);r.scrollIntoView({block:"center",behavior:"smooth"});r.classList.add("gcv-admin-target");
-r.querySelectorAll("input,select,textarea").forEach(i=>i.classList.add("gcv-admin-target-input"));
-}
-function initAdminHighlight(){
-const m=location.hash.match(/^#gcv=(.+)$/);if(!m)return;
-const t=normalizeLabel(decodeURIComponent(m[1]));if(!t)return;
-let tr=0;const ti=setInterval(()=>{tr+=1;const r=findAdminFieldRow(t);if(r){clearInterval(ti);highlightAdminRow(r);}else if(tr>40)clearInterval(ti);},250);
-}
+  function categoryProfile(category) {
+    return CATEGORY_PROFILES.find((profile) => profile.key === category) || GENERIC_CATEGORY_PROFILE;
+  }
 
-function emptyResult(){return{rowResults:new Map(),cellResults:new Map(),findings:[]};}
-function addDetail(t,d){if(!d)return;if(!t.details)t.details=[];const s=`${d.label||""}|${d.value||""}`;if(!t.details.some(i=>`${i.label||""}|${i.value||""}`===s))t.details.push(d);}
-function noteResult(r,row,i,s,m,tt,src="",af=true,d=null){
-if(!row)return;
-const pr=r.rowResults.get(row)||{status:"ok",messages:new Set(),tooltips:new Set()};
-if(STATUS_RANK[s]>STATUS_RANK[pr.status])pr.status=s;
-pr.messages.add(m);if(tt)pr.tooltips.add(tt);addDetail(pr,d);r.rowResults.set(row,pr);
-const c=rowCells(row)[i];
-if(c){
-const pc=r.cellResults.get(c)||{status:"ok",messages:new Set(),tooltips:new Set(),sources:new Set()};
-if(STATUS_RANK[s]>STATUS_RANK[pc.status])pc.status=s;
-pc.messages.add(m);pc.productIndex=i;pc.rowTitle=row.title;
-if(tt)pc.tooltips.add(tt);if(src)pc.sources.add(src);addDetail(pc,d);r.cellResults.set(c,pc);
-}
-if(af&&s!=="ok")r.findings.push(m);
-}
+  function detectProductCategory(product) {
+    const haystack = `${product?.name || ""} ${product?.href || ""}`;
+    return (CATEGORY_PROFILES.find((profile) => profile.pattern.test(haystack)) || GENERIC_CATEGORY_PROFILE).key;
+  }
 
-function runLocalValidation(rows,products){
-const r=emptyResult();
-rows.forEach(row=>{row.values.forEach((v,i)=>{
-const is=dimensionFormatIssues(v,row.title);if(!is.length)return;
-const m=`${row.title}: ${is.join("; ")} у ${productLabel(products,i)}`;
-noteResult(r,row,i,"error",m,is.join("; "));
-});});
-return r;
-}
+  function canonicalLabel(label) {
+    const key = normalizeLabel(label)
+      .replace(/(?:^|\s)(?:см|мм|кг|л|вт|квт|квтч|квт ч|kwh|wh|об\s+мин|°c|градус(?:ов)?|шт)(?=\s|$)/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const rule = CANONICAL_LABEL_RULES.find((item) => item.patterns.some((pattern) => pattern.test(key)));
+    return rule ? rule.key : key;
+  }
 
-function closePopover(){if(!openPopover)return;openPopover.element.remove();openPopover=null;}
-function ensurePopoverListeners(){if(popoverListenersReady)return;popoverListenersReady=true;document.addEventListener("click",e=>{if(!openPopover)return;if(e.target.closest(".gcv-popover,.gcv-info-button"))return;closePopover();});}
-function showPopover(cell,item,btn){
-ensurePopoverListeners();closePopover();
-const p=document.createElement("div");p.className="gcv-popover";p.setAttribute("role","dialog");
-const h=document.createElement("div");h.className="gcv-popover-head";
-const t=document.createElement("strong");t.textContent=item.status==="error"?"Расхождение":"Подробности проверки";
-const c=document.createElement("button");c.type="button";c.className="gcv-popover-close";c.textContent="×";c.addEventListener("click",closePopover);
-h.append(t,c);p.appendChild(h);
-const ds=item.details||[];
-if(ds.length){ds.forEach(d=>{const r=document.createElement("div");r.className="gcv-popover-row";const v=document.createElement("span");v.textContent=`${d.label?`${d.label}: `:""}${d.value||"пусто"}`;r.appendChild(v);p.appendChild(r);});}
-else Array.from(item.messages||[]).forEach(m=>{const r=document.createElement("div");r.className="gcv-popover-message";r.textContent=m;p.appendChild(r);});
-document.body.appendChild(p);
-const br=btn.getBoundingClientRect(),pr=p.getBoundingClientRect();
-const l=Math.min(Math.max(8,br.left),window.innerWidth-pr.width-8);
-const bel=br.bottom+8;const tp=bel+pr.height<=window.innerHeight-8?bel:Math.max(8,br.top-pr.height-8);
-p.style.left=`${l}px`;p.style.top=`${tp}px`;
-openPopover={element:p,button:btn};
-}
+  let hasRun = false;
+  let hasStarted = false;
+  let runInProgress = false;
+  let runSequence = 0;
+  let autoTimer = null;
+  const officialCache = new Map();
+  const manualCache = new Map();
+  const webSearchCache = new Map();
+  let currentProductEditBase = "";
 
-function removeAnnotations(){closePopover();document.querySelectorAll(".gcv-badge,.gcv-source,.gcv-cell-source,.gcv-info-button,.gcv-edit-card").forEach(i=>i.remove());document.querySelectorAll(ROW_SELECTOR).forEach(r=>r.classList.remove("gcv-row-ok","gcv-row-warning","gcv-row-error"));}
-function renderResults(r,ps){
-removeAnnotations();
-r.rowResults.forEach((i,row)=>row.element.classList.add(`gcv-row-${i.status}`));
-r.cellResults.forEach((i,cell)=>{
-if(!cell)return;
-const b=document.createElement("span");b.className=`gcv-badge gcv-badge-${i.status}`;b.textContent=i.status==="error"?"❌":i.status==="warning"?"⚠️":"✅";
-b.style.cssText="margin-left:8px;font-size:14px;";cell.append(" ",b);
-if((i.details||[]).length||i.messages?.size){const inf=document.createElement("button");inf.type="button";inf.className="gcv-info-button";inf.textContent="ℹ";inf.addEventListener("click",()=>{showPopover(cell,i,inf);});cell.append(" ",inf);}
-if(i.status!=="ok"&&i.productIndex!=null&&ps[i.productIndex]){const hr=editUrl(ps[i.productIndex],i.rowTitle);if(hr){const a=document.createElement("a");a.className="gcv-cell-source";a.href=hr;a.target="_blank";a.rel="noreferrer";a.textContent="→Редактировать";a.style.cssText="margin-left:8px;color:#0066cc;text-decoration:underline;cursor:pointer;";cell.append(" ",a);}}
-});
-}
+  function sourceUrl() { return window.location.href; }
+  function isProductPage() { return window.location.pathname.includes('/catalog/'); }
+  function pageMode() { return isProductPage() ? "product" : "compare"; }
+  function isAdminPage() { return window.location.pathname.includes("/bitrix/admin/iblock_element_edit.php"); }
 
-function ensurePanel(){
-let p=document.getElementById(PANEL_ID);if(p)return p;
-const s=document.createElement("style");
-s.textContent=`#${PANEL_ID}{position:fixed;z-index:2147483646;top:14px;right:14px;width:min(430px,calc(100vw - 28px));max-height:calc(100vh - 28px);overflow:auto;background:#fff;color:#17212b;border:1px solid #e5e5e5;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.15);font-family:system-ui,sans-serif;font-size:13px;}.gcv-head{display:flex;justify-content:space-between;align-items:center;padding:10px;background:#f5f5f5;border-bottom:1px solid #e5e5e5;}.gcv-title{font-weight:bold;}.gcv-head button{background:none;border:none;cursor:pointer;color:#0066cc;}.gcv-body{padding:10px;}.gcv-collapsed .gcv-body{display:none;}.gcv-summary{margin:0 0 10px 0;font-weight:bold;}.gcv-note{margin:5px 0;padding:8px;background:#fff9e6;border-left:3px solid #ffc107;}.gcv-list{margin:0;padding:0 0 0 20px;}.gcv-list li{margin:4px 0;}.gcv-popover{position:fixed;background:#fff;border:1px solid #ccc;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.2);z-index:2147483647;max-width:300px;}.gcv-popover-head{padding:8px 10px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;background:#f9f9f9;}.gcv-popover-close{background:none;border:none;font-size:18px;cursor:pointer;color:#999;}.gcv-popover-row,.gcv-popover-message{padding:6px 10px;border-bottom:1px solid #f0f0f0;word-wrap:break-word;}.gcv-row-error{background:#ffe6e6!important;}.gcv-row-warning{background:#fff9e6!important;}.gcv-row-ok{background:#e6f7e6!important;}.gcv-badge{display:inline-block;}.gcv-info-button{background:#0066cc;color:#fff;border:none;border-radius:50%;width:18px;height:18px;padding:0;cursor:pointer;font-size:12px;}.gcv-cell-source{display:inline-block;margin-left:8px;color:#0066cc;text-decoration:underline;cursor:pointer;font-size:12px;}`;
-document.head.appendChild(s);
-p=document.createElement("section");p.id=PANEL_ID;
-p.innerHTML=`<div class="gcv-head"><span class="gcv-title">Проверка сравнения v1.3.0</span><button data-action="toggle">Скрыть</button></div><div class="gcv-body"><div style="text-align:center;"><button data-action="run" style="padding:6px 12px;background:#0066cc;color:#fff;border:none;border-radius:3px;cursor:pointer;">Запустить проверку</button></div><div class="gcv-output"></div></div>`;
-p.querySelector('[data-action="run"]').addEventListener("click",()=>runChecks());
-p.querySelector('[data-action="toggle"]').addEventListener("click",e=>{p.classList.toggle("gcv-collapsed");e.currentTarget.textContent=p.classList.contains("gcv-collapsed")?"Показать":"Скрыть";});
-document.body.appendChild(p);return p;
-}
-function renderPanel(r,ps){
-const p=ensurePanel(),o=p.querySelector(".gcv-output");
-const errs=[...r.rowResults.values()].filter(i=>i.status==="error").length;
-const warns=[...r.rowResults.values()].filter(i=>i.status==="warning").length;
-o.replaceChildren();
-const sm=document.createElement("p");sm.className="gcv-summary";sm.textContent=`Ошибок: ${errs}. Предупреждений: ${warns}. Проверено: ${r.rowResults.size}.`;o.appendChild(sm);
-const fs=[...new Set(r.findings)];
-if(!fs.length){const ok=document.createElement("p");ok.textContent="✅ Ошибок не найдено.";o.appendChild(ok);return;}
-const l=document.createElement("ul");l.className="gcv-list";fs.forEach(m=>{const i=document.createElement("li");i.textContent=m;l.appendChild(i);});o.appendChild(l);
-}
+  function textOf(element) {
+    if (!element) return "";
+    const copy = element.cloneNode(true);
+    copy.querySelectorAll(".glossary-tooltip, .gcv-badge, .gcv-source, .gcv-cell-source").forEach((item) => item.remove());
+    const ul = copy.querySelector('ul');
+    if (ul) return Array.from(ul.querySelectorAll('li')).map(li => li.textContent.trim()).join(', ');
+    return String(copy.innerText || copy.textContent || "").replace(/\s+/g, " ").trim();
+  }
 
-async function waitForStableTable(){let pc=0,sp=0;for(let a=0;a<14;a+=1){const c=readTable().length;if(c>0&&c===pc)sp+=1;else sp=0;if(sp>=2)return;pc=c;await new Promise(r=>window.setTimeout(r,500));}}
-async function runChecks(){
-if(runInProgress)return;runInProgress=true;
-await waitForStableTable();
-const rows=readTable();
-if(rows.length<1){renderPanel({...emptyResult(),findings:[`Таблица не найдена: ${window.location.href}`]},[], false);runInProgress=false;return;}
-const cr=++runSequence;hasRun=true;
-const ps=readProducts(rows);
-const ep=Promise.all(ps.map(p=>fetchEditBaseUrl(p).then(u=>{p.editBase=u;})));
-const lr=runLocalValidation(rows,ps);
-renderResults(lr,ps);renderPanel(lr,ps);
-await ep;if(cr!==runSequence)return;
-renderResults(lr,ps);
-renderPanel(lr,ps);runInProgress=false;
-}
-function start(){
-if(hasStarted)return;hasStarted=true;ensurePanel();
-const obs=new MutationObserver(()=>{if(hasRun||runInProgress||document.querySelectorAll(ROW_SELECTOR).length<1)return;window.clearTimeout(autoTimer);autoTimer=window.setTimeout(()=>runChecks(),1000);});
-obs.observe(document.body,{childList:true,subtree:true});
-autoTimer=window.setTimeout(()=>runChecks(),1500);
-}
+  function isOfficialProductPage() {
+    return window.location.origin === OFFICIAL_ORIGIN && window.location.pathname.startsWith("/products/");
+  }
 
-if(isAdminPage()){if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",initAdminHighlight,{once:true});else initAdminHighlight();}
-else if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",start,{once:true});}
-else{start();window.addEventListener("load",start,{once:true});}
+  function officialAnchorUrl(source, label) {
+    if (!source || !label) return source || "";
+    try {
+      const url = new URL(source);
+      url.hash = `gcv-field=${encodeURIComponent(label)}`;
+      return url.href;
+    } catch (_) {
+      return source;
+    }
+  }
+
+  function focusOfficialField() {
+    const requested = new URLSearchParams(window.location.hash.slice(1)).get("gcv-field");
+    if (!requested) return;
+    const target = normalizeLabel(requested.replace(/^функция\s*:\s*/i, ""));
+    const highlight = () => {
+      const names = document.querySelectorAll([
+        ".products-detail__main-props-list-item-name",
+        ".products-detail__tech-groups-list-item-name",
+        ".products-detail__advantages-thumbs-item-text",
+        ".products-detail__advantages-title",
+      ].join(","));
+      const matches = [...names]
+        .filter((element) => {
+          const name = normalizeLabel(textOf(element));
+          return name === target || name.includes(target) || target.includes(name);
+        })
+        .map((element) => element.closest(
+          ".products-detail__main-props-list-item, .products-detail__tech-groups-list-item, .products-detail__advantages-thumbs-item, .products-detail__advantages-item"
+        ) || element);
+      if (!matches.length) return false;
+
+      let style = document.getElementById("gcv-anchor-style");
+      if (!style) {
+        style = document.createElement("style");
+        style.id = "gcv-anchor-style";
+        style.textContent = ".gcv-anchor-highlight{outline:3px solid #e33434!important;outline-offset:3px;background:rgba(255,72,72,.16)!important;box-shadow:0 0 0 6px rgba(255,72,72,.12)!important;transition:background .2s ease}";
+        document.head.appendChild(style);
+      }
+      matches.forEach((element) => element.classList.add("gcv-anchor-highlight"));
+      matches[0].scrollIntoView({ behavior: "smooth", block: "center" });
+      window.setTimeout(() => matches.forEach((element) => element.classList.remove("gcv-anchor-highlight")), 7000);
+      return true;
+    };
+
+    if (highlight()) return;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      attempts += 1;
+      if (highlight() || attempts >= 40) window.clearInterval(timer);
+    }, 500);
+  }
+
+  function numbersOf(value) {
+    return (normalize(value).match(/\d+(?:\.\d+)?/g) || []).map(Number);
+  }
+
+  function numberOf(value) {
+    const numbers = numbersOf(value);
+    return numbers.length ? numbers[0] : null;
+  }
+
+  function isMissing(value) {
+    const key = normalize(value).replace(/[\u2020*]+/g, "").trim();
+    return !key || /^(?:не указано|неизвестно|[-—–])$/.test(key);
+  }
+
+  function isNegative(value) {
+    const key = normalize(value);
+    return /^(?:нет|no|[-—–]|false|отсутствует)$/.test(key) || key === "0";
+  }
+
+  function isPositive(value) {
+    const key = normalize(value);
+    return /^(?:да|есть|\+|yes|true|имеется|присутствует)$/.test(key) || key === "1";
+  }
+
+  function booleanKey(value) {
+    const key = normalize(value);
+    if (/^(?:да|есть|\+|yes|true|имеется|присутствует)$/.test(key) || key === "1") return "yes";
+    if (/^(?:нет|no|-|false|отсутствует)$/.test(key) || key === "0") return "no";
+    return "";
+  }
+
+  function unitInfo(value) {
+    const key = normalize(value);
+    if (/(?:^|[\s,(])(?:квтч|квт\/ч|kwh)(?:$|[\s,.)])/.test(key)) return { group: "energy", factor: 1, name: "кВт·ч" };
+    if (/(?:^|[\s,(])квт(?:$|[\s,.)])/.test(key)) return { group: "power", factor: 1000, name: "кВт" };
+    if (/(?:^|[\s,(])вт(?:$|[\s,.)])/.test(key)) return { group: "power", factor: 1, name: "Вт" };
+    if (/(?:^|[\s,(])(?:мм|миллиметр|милиметр)(?:а|ов|ы|$|[\s,.)])/.test(key)) return { group: "length", factor: 1, name: "мм" };
+    if (/(?:^|[\s,(])(?:см|сантиметр)(?:а|ов|ы|$|[\s,.)])/.test(key)) return { group: "length", factor: 10, name: "см" };
+    if (/(?:^|[\s,(])кг(?:$|[\s,.)])/.test(key)) return { group: "weight", factor: 1, name: "кг" };
+    if (/(?:^|[\s,(])л(?:$|[\s,.)])/.test(key)) return { group: "volume", factor: 1, name: "л" };
+    if (/(?:°c|градус)/.test(key)) return { group: "temperature", factor: 1, name: "°C" };
+    if (/(?:об\s*\/\s*мин|об\s+мин)/.test(key)) return { group: "speed", factor: 1, name: "об/мин" };
+    return null;
+  }
+
+  function unitsForLabel(label, value) {
+    return unitInfo(label) || unitInfo(value) || { group: "number", factor: 1, name: "" };
+  }
+
+  function valuesEqual(first, second) {
+    const leftBool = booleanKey(first);
+    const rightBool = booleanKey(second);
+    if (leftBool && rightBool) return leftBool === rightBool;
+
+    const stripUnits = (value) => normalize(value)
+      .replace(/[\u2020*]+/g, "")
+      .replace(/(?:квтч|квт\/ч|квт|вт|см|мм|кг|°c|°|градусов|кwh|kwh)/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const left = stripUnits(first);
+    const right = stripUnits(second);
+    if (!left || !right) return left === right;
+    if (left === right || left.includes(right) || right.includes(left)) return true;
+
+    const leftNumbers = numbersOf(left);
+    const rightNumbers = numbersOf(right);
+    if (leftNumbers.length > 0
+      && leftNumbers.length === rightNumbers.length
+      && (
+        leftNumbers.every((number, index) => Math.abs(number - rightNumbers[index]) < 0.01)
+        || leftNumbers.slice().sort((a, b) => a - b).every((number, index) => Math.abs(number - rightNumbers.slice().sort((a, b) => a - b)[index]) < 0.01)
+      )) return true;
+
+    const listKey = (value) => normalize(value)
+      .replace(/климатический класс|температурные режимы/g, " ")
+      .split(/[^a-zа-яё0-9]+/)
+      .filter(Boolean)
+      .sort()
+      .join(" ");
+    if (/климатический класс/.test(left + right) && listKey(left) === listKey(right)) return true;
+    return false;
+  }
+
+  function semanticValue(value) {
+    const semantic = normalize(value)
+      .replace(/[\u2020*]+/g, "")
+      .replace(/стеклокерамическ[а-яё]*/g, "стеклокерамика")
+      .replace(/стеклокерамик[а-яё]*/g, "стеклокерамика")
+      .replace(/no\s*frost/g, "nofrost")
+      .replace(/стеклян[а-яё]*/g, "стекло")
+      .replace(/эмалирован[а-яё]*/g, "эмаль")
+      .replace(/газов[а-яё]*/g, "газ")
+       .replace(/электрон[а-яё]*/g, "электронное управление")
+      .replace(/автоматическ[а-яё]*/g, "автоматический")
+      .replace(/слайдер[а-яё]*|сенсор[а-яё]*/g, "электронное управление")
+      .replace(/механическ[а-яё]*/g, "механическое управление")
+      .replace(/черн[а-яё]*/g, "черный")
+      .replace(/бел[а-яё]*/g, "белый")
+      .replace(/серебрист[а-яё]*/g, "серебристый")
+      .replace(/светов[а-яё]*/g, "свет")
+      .replace(/звуков[а-яё]*/g, "звук")
+      .replace(/рамк[а-яё]*/g, "рамка")
+      .replace(/нержавеющ[а-яё]*\s*сталь/g, "нержавеющая сталь")
+      .replace(/\b(?:варочная|варочные|панель|поверхность)\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return normalize(foldHomoglyphs(semantic));
+  }
+
+  function compareText(first, second) {
+    if (normalize(first) === normalize(second)) return true;
+    if (valuesEqual(first, second)) return true;
+
+    const controlType = (value) => {
+      const key = normalize(value);
+      if (/электрон|сенсор|слайдер|slider|touch|цифров/.test(key)) return "electronic";
+      if (/механическ|поворотн/.test(key)) return "mechanical";
+      return "";
+    };
+    const leftControl = controlType(first);
+    const rightControl = controlType(second);
+    if (leftControl && leftControl === rightControl) return true;
+
+    const left = semanticValue(first);
+    const right = semanticValue(second);
+    if (!left || !right) return false;
+    if (left === right || left.includes(right) || right.includes(left)) return true;
+
+    const leftTokens = left.split(/[^a-zа-яё0-9]+/).filter(t => t.length > 2);
+    const rightTokens = right.split(/[^a-zа-яё0-9]+/).filter(t => t.length > 2);
+    if (leftTokens.length > 0 && rightTokens.length > 0) {
+        const intersection = leftTokens.filter(t => rightTokens.some(rt => rt.includes(t) || t.includes(rt)));
+        const distinct = [...new Set(intersection)];
+        if (distinct.length >= 2) return true;
+        if (distinct.length === 1 && distinct[0].length >= 6) return true;
+    }
+    return false;
+  }
+
+  function parseDimensionParts(value) {
+    return normalize(value)
+      .replace(/(?:см|мм)/g, "")
+      .split(/\s*[xх×]\s*/i)
+      .map((part) => numbersOf(part));
+  }
+
+  function dimensionSourceOrder(label, fallback = ["height", "width", "depth"]) {
+    const key = normalizeLabel(label)
+      .replace(/\bширина\b/g, "ш")
+      .replace(/\bвысота\b/g, "в")
+      .replace(/\bглубина\b/g, "г")
+      .replace(/\s+/g, " ");
+    if (/ш\s*x\s*в\s*x\s*г/.test(key)) return ["width", "height", "depth"];
+    if (/в\s*x\s*ш\s*x\s*г/.test(key)) return ["height", "width", "depth"];
+    return fallback;
+  }
+
+  function dimensionDisplay(value, label = "") {
+    const parts = parseDimensionParts(value);
+    if (parts.length !== 3) return String(value ?? "").replace(/(\d),(\d)/g, "$1.$2");
+    const order = dimensionSourceOrder(label);
+    const byName = Object.fromEntries(order.map((name, index) => [name, parts[index]]));
+    return ["height", "width", "depth"].map((name) => byName[name]?.[0] ?? "").join(" х ");
+  }
+
+  function dimensionFormatIssues(value, title = "") {
+    const raw = String(value ?? "").trim();
+    const key = normalizeLabel(title);
+    const isDimension = !title || /размер|габарит|ниши|упаковк|(?:^|\s)(?:высота|ширина|глубина)(?:\s|$)/.test(key);
+    if (!isDimension) return [];
+    const issues = [];
+    if (/\d\s*,\s*\d/.test(raw)) issues.push("десятичный разделитель — запятая; нужна точка");
+    if (/\d\s*x\s*\d/i.test(raw)) issues.push("использована английская «x»; нужен русский разделитель «х»");
+    return issues;
+  }
+
+  function compareNumberPart(localValue, officialValue, localUnit, officialUnit) {
+    const local = numbersOf(localValue).map((number) => number * (localUnit?.factor || 1));
+    const official = numbersOf(officialValue).map((number) => number * (officialUnit?.factor || 1));
+    if (!local.length || !official.length) return null;
+    if (localUnit?.group && officialUnit?.group && localUnit.group !== officialUnit.group) return false;
+    if (local.length === official.length) {
+      return local.every((number, index) => Math.abs(number - official[index]) < 0.01);
+    }
+    if (local.length === 1 && official.length > 1) {
+      return local[0] >= Math.min(...official) - 0.01 && local[0] <= Math.max(...official) + 0.01;
+    }
+    if (official.length === 1 && local.length > 1) {
+      return official[0] >= Math.min(...local) - 0.01 && official[0] <= Math.max(...local) + 0.01;
+    }
+    return false;
+  }
+
+  function compareDimension(localValue, localMeta, entry) {
+    const localParts = parseDimensionParts(localValue);
+    const officialParts = parseDimensionParts(entry.value);
+    if (localParts.length !== 3 || officialParts.length !== 3) return null;
+
+    const lUnit = unitsForLabel(localMeta.title, localValue);
+    const oUnit = entry.unit || unitsForLabel(entry.label, entry.value);
+
+    const localByName = Object.fromEntries(localMeta.order.map((name, index) => [name, localParts[index]]));
+    const officialByName = Object.fromEntries(entry.dimensionOrder.map((name, index) => [name, officialParts[index]]));
+    return ["height", "width", "depth"].every((name) => compareNumberPart(
+      localByName[name]?.join(" "),
+      officialByName[name]?.join(" "),
+      lUnit, oUnit
+    ) === true);
+  }
+
+  function compareWithEntry(localValue, localTitle, entry, localMeta) {
+    if (localMeta?.dimension && entry.dimensionKind) {
+      if (localMeta.part && entry.dimensionPart) {
+        return compareNumberPart(localValue, entry.value, unitsForLabel(localTitle, localValue), entry.unit || unitsForLabel(entry.label, entry.value));
+      }
+      return compareDimension(localValue, localMeta, entry);
+    }
+
+    const localCanonical = canonicalLabel(localTitle);
+    if (localCanonical === "oven-type" && !/(?:газ|электр|комбинир)/i.test(entry.value)) return null;
+    if (localCanonical === "control") {
+      const controlFamily = (value) => {
+        const key = normalize(value);
+        if (/электрон|сенсор|слайдер|slider|touch|цифров/.test(key)) return "electronic";
+        if (/механическ|поворотн/.test(key)) return "mechanical";
+        if (/кнопк|переключател/.test(key)) return "form";
+        return "";
+      };
+      const localFamily = controlFamily(localValue);
+      const officialFamily = controlFamily(entry.value);
+      if (localFamily === "form" || officialFamily === "form") {
+        if (localFamily !== officialFamily) return null;
+      }
+    }
+
+    if (isMissing(localValue)) return isMissing(entry.value) ? true : false;
+
+    if (isPositive(localValue)) {
+        if (isPositive(entry.value)) return true;
+        const officialNums = numbersOf(entry.value);
+        if (officialNums.length > 0 && officialNums.some(n => n > 0)) return true;
+        if (entry.value && entry.value.length > 3 && !isNegative(entry.value)) return true;
+        return false;
+    }
+    if (isNegative(localValue)) {
+      if (isNegative(entry.value)) return true;
+      const officialNums = numbersOf(entry.value);
+      if (officialNums.length > 0 && officialNums.every(n => n === 0)) return true;
+      return false;
+    }
+
+    // «Да» подтверждает только явно положительное описание функции, но не
+    // произвольную категорию вроде «традиционная» или «механическое».
+    if (isPositive(entry.value) && !isMissing(localValue) && !isNegative(localValue)) {
+      const featureValue = normalize(localValue);
+      if (/(?:автомат|электроподжиг|газ-контрол|инвертор|no\s*frost|fresh|steam|пар|aqua|пирол|катал|освещ|подсвет|индикатор|индикац|цифров|защит|таймер|диспле|connect|adapt|super|big|есть|да)/.test(featureValue)) return true;
+    }
+
+    if (compareText(localValue, entry.value)) return true;
+
+    const localNumbers = numbersOf(localValue);
+    const officialNumbers = numbersOf(entry.value);
+    if (localNumbers.length && officialNumbers.length) {
+      const numberResult = compareNumberPart(localValue, entry.value, unitsForLabel(localTitle, localValue), unitsForLabel(entry.label, entry.value));
+      if (numberResult !== null) return numberResult;
+    }
+    return false;
+  }
+
+  function readTable() {
+    const rowsSelectors = isProductPage() ? ".characteristics__row" : ".compare-table-block__row.js-compare-row";
+    return [...document.querySelectorAll(rowsSelectors)]
+      .map((element) => {
+        const titleEl = element.querySelector(isProductPage() ? ".characteristics__name" : ".js-compare-cell-title");
+        const valEl = element.querySelector(isProductPage() ? ".characteristics__property" : ".swiper-wrapper > .compare-table-block__cell.js-compare-cell");
+
+        let values = [];
+        if (isProductPage()) {
+            values = [textOf(valEl)];
+        } else {
+            values = [...element.querySelectorAll(".swiper-wrapper > .compare-table-block__cell.js-compare-cell")].map(textOf);
+        }
+
+        return {
+          element,
+          title: textOf(titleEl),
+          titleElement: titleEl,
+          values: values,
+        };
+      })
+      .filter((row) => row.title);
+  }
+
+  function rowCells(row) {
+    if (isProductPage()) return [row.element.querySelector(".characteristics__property")];
+    return [...row.element.querySelectorAll(".swiper-wrapper > .compare-table-block__cell.js-compare-cell")];
+  }
+
+  function findRow(rows, pattern) {
+    return rows.find((row) => pattern.test(normalizeLabel(row.title)));
+  }
+
+  function readProducts(rows) {
+    if (isProductPage()) {
+        const h1 = document.querySelector('h1');
+        const name = h1 ? h1.textContent.trim() : document.title;
+        const articleRow = findRow(rows, /^артикул/);
+        const product = { name, href: window.location.href, id: "", article: articleRow?.values[0] || "" };
+        product.category = detectProductCategory(product);
+        product.model = modelCandidates(product)[0] || "";
+        return [product];
+    }
+    const articleRow = findRow(rows, /^артикул/);
+    return [...document.querySelectorAll(".comparison-card.swiper-slide")]
+      .map((card, index) => {
+        const title = card.querySelector(".comparison-card__type-and-title");
+        const removeButton = card.querySelector(".js-compare_remove");
+        const product = {
+          name: textOf(title) || "Товар без названия",
+          href: title?.href || card.querySelector("a[href]")?.href || "",
+          id: removeButton?.dataset.id || "",
+          article: articleRow?.values[index] || "",
+        };
+        product.category = detectProductCategory(product);
+        product.model = modelCandidates(product)[0] || "";
+        return product;
+      });
+  }
+
+  function productLabel(products, index) {
+    const product = products[index];
+    if (!product) return `товар №${index + 1}`;
+    return product.name + (product.id ? ` (ID ${product.id})` : "");
+  }
+
+  function emptyResult() {
+    return { rowResults: new Map(), cellResults: new Map(), findings: [] };
+  }
+
+  function addDetail(target, detail) {
+    if (!detail) return;
+    if (!target.details) target.details = [];
+    const signature = `${detail.label || ""}|${detail.anchorLabel || ""}|${detail.value || ""}|${detail.source || ""}`;
+    if (!target.details.some((item) => `${item.label || ""}|${item.anchorLabel || ""}|${item.value || ""}|${item.source || ""}` === signature)) {
+      target.details.push(detail);
+    }
+  }
+
+  function noteResult(result, row, index, status, message, tooltip, source = "", addFinding = true, detail = null) {
+    if (!row) return;
+    const previousRow = result.rowResults.get(row) || { status: "ok", messages: new Set(), tooltips: new Set() };
+    previousRow.rowTitle = row.title;
+    if (STATUS_RANK[status] > STATUS_RANK[previousRow.status]) previousRow.status = status;
+    previousRow.messages.add(message);
+    if (tooltip) previousRow.tooltips.add(tooltip);
+    addDetail(previousRow, detail);
+    result.rowResults.set(row, previousRow);
+
+    const cells = rowCells(row);
+    const cell = cells[index];
+    if (cell) {
+      const previousCell = result.cellResults.get(cell) || { status: "ok", messages: new Set(), tooltips: new Set(), sources: new Set(), details: [] };
+      previousCell.productIndex = index;
+      previousCell.rowTitle = row.title;
+      if (STATUS_RANK[status] > STATUS_RANK[previousCell.status]) previousCell.status = status;
+      previousCell.messages.add(message);
+      if (tooltip) previousCell.tooltips.add(tooltip);
+      if (source) previousCell.sources.add(source);
+      addDetail(previousCell, detail);
+      result.cellResults.set(cell, previousCell);
+    }
+    if (addFinding && status !== "ok") result.findings.push(message);
+  }
+
+  function formatOfficialValue(value, label = "") {
+    const raw = String(value ?? "").replace(/\s+/g, " ").trim();
+    const key = normalizeLabel(label);
+    const isDimension = /(?:размер|габарит|высот|ширин|глубин|ниши|упаковк)/.test(key);
+    if (!isDimension) return raw;
+    const normalizedRaw = raw.replace(/(\d)\s*,\s*(?=\d)/g, "$1.");
+    const sourceUnit = unitInfo(label) || unitInfo(value);
+    const convertMillimeters = sourceUnit?.group === "length" && sourceUnit.factor === 1;
+    const formatNumber = (part) => {
+      const number = Number(part) / (convertMillimeters ? 10 : 1);
+      return String(Number(number.toFixed(10)));
+    };
+    const parts = normalizedRaw.match(/\d+(?:\.\d+)?/g);
+    if (!parts) return normalizedRaw;
+    if (parts.length !== 3) {
+      return convertMillimeters
+        ? normalizedRaw.replace(/\d+(?:\.\d+)?/g, formatNumber)
+        : normalizedRaw;
+    }
+    const values = parts.map(formatNumber);
+    const order = dimensionSourceOrder(label);
+    const byName = Object.fromEntries(order.map((name, index) => [name, values[index]]));
+    return ["height", "width", "depth"].map((name) => byName[name]).join(" х ");
+  }
+
+  function normalizedDimensionUnit(unit, label = "") {
+    if (unit?.group === "length" && unit.factor === 1 && /(?:размер|габарит|высот|ширин|глубин|ниши|упаковк)/.test(normalizeLabel(label))) {
+      return { ...unit, factor: 10, name: "см" };
+    }
+    return unit;
+  }
+
+  function displayDimensionLabel(label) {
+    return String(label ?? "")
+      .replace(/\(\s*[шw]\s*[xх×]\s*[вv]\s*[xх×]\s*[гgd]\s*\)/gi, "(ВхШхГ)")
+      .replace(/\b[шw]\s*[xх×]\s*[вv]\s*[xх×]\s*[гgd]\b/gi, "ВхШхГ");
+  }
+
+  function editUrl(base, label = "") {
+    if (!base) return "";
+    try {
+      const url = new URL(base, window.location.origin);
+      if (label) url.hash = `gcv=${encodeURIComponent(label)}`;
+      return url.href;
+    } catch (_) {
+      return base;
+    }
+  }
+
+  async function fetchEditBaseUrl(product) {
+    if (!product) return "";
+    if (product.editBase) return product.editBase;
+    const makeUrl = (id) => id
+      ? `${window.location.origin}/bitrix/admin/iblock_element_edit.php?IBLOCK_ID=1099&type=gr_catalog&lang=ru&ID=${encodeURIComponent(id)}&find_section_section=-1&WF=Y`
+      : "";
+    if (product.id) return makeUrl(product.id);
+    if (!product.href) return "";
+    try {
+      const html = await requestHtml(product.href);
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const detail = doc.querySelector(".js-ecom_product-detail[data-id], [data-element-id], [data-product-id]");
+      const id = detail?.dataset.id || detail?.dataset.elementId || detail?.dataset.productId || "";
+      return makeUrl(id);
+    } catch (error) {
+      console.warn("[GCV] Не удалось получить ссылку редактирования", product.href, error);
+      return "";
+    }
+  }
+
+  function findAdminFieldRow(label) {
+    const target = normalizeLabel(formatOfficialValue(label));
+    if (!target) return null;
+    const candidates = [...document.querySelectorAll("tr, .adm-detail-content-item-block, .adm-detail-content-cell-l")];
+    return candidates.find((row) => {
+      const labelElement = row.querySelector(".adm-detail-content-cell-l, label, th, td:first-child");
+      const text = normalizeLabel(formatOfficialValue(labelElement?.textContent || row.textContent));
+      return text === target || text.includes(target) || target.includes(text);
+    }) || null;
+  }
+
+  function highlightAdminRow(label) {
+    const row = findAdminFieldRow(label);
+    if (!row) return false;
+    let style = document.getElementById("gcv-admin-highlight-style");
+    if (!style) {
+      style = document.createElement("style");
+      style.id = "gcv-admin-highlight-style";
+      style.textContent = ".gcv-admin-highlight{background:#fff0bf!important;outline:2px solid #f0a000!important;outline-offset:-2px}.gcv-admin-highlight input,.gcv-admin-highlight textarea,.gcv-admin-highlight select{box-shadow:0 0 0 2px rgba(240,160,0,.35)!important}";
+      document.head.appendChild(style);
+    }
+    document.querySelectorAll(".gcv-admin-highlight").forEach((item) => item.classList.remove("gcv-admin-highlight"));
+    row.classList.add("gcv-admin-highlight");
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
+    return true;
+  }
+
+  function initAdminHighlight() {
+    const requested = new URLSearchParams(window.location.hash.slice(1)).get("gcv");
+    if (!requested) return;
+    const label = requested.trim();
+    if (highlightAdminRow(label)) return;
+    let attempts = 0;
+    const timer = window.setInterval(() => {
+      attempts += 1;
+      if (highlightAdminRow(label) || attempts >= 40) window.clearInterval(timer);
+    }, 500);
+  }
+
+  function renderProductEditLinks(products) {
+    if (isProductPage()) return;
+    document.querySelectorAll(".comparison-card.swiper-slide").forEach((card, index) => {
+      const product = products[index];
+      if (!product?.editBase) return;
+      let link = card.querySelector(".gcv-edit-card");
+      if (!link) {
+        link = document.createElement("a");
+        link.className = "gcv-edit-card";
+        link.textContent = "✏️";
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        link.title = "Редактировать карточку";
+        const title = card.querySelector(".comparison-card__type-and-title");
+        if (title) title.insertAdjacentElement("afterend", link);
+        else card.prepend(link);
+      }
+      link.href = editUrl(product.editBase);
+    });
+  }
+
+  function patchCardEditButton(result, rows) {
+    if (!isProductPage() || !currentProductEditBase) return;
+    const problem = [...result.rowResults.entries()].find(([item]) => item.status !== "ok");
+    const label = problem?.[1]?.rowTitle || problem?.[0]?.title || rows.find((row) => row.title)?.title || "";
+    let link = document.querySelector(".gcv-product-edit");
+    if (!link) {
+      link = document.createElement("a");
+      link.className = "gcv-edit-card gcv-product-edit";
+      link.textContent = "✏️ Редактировать";
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.style.cssText = "display:inline-block;margin:8px 0;color:#c87900;text-decoration:none;font-weight:600;";
+      const title = document.querySelector("h1");
+      (title?.parentElement || document.body).appendChild(link);
+    }
+    link.href = editUrl(currentProductEditBase, label);
+    link.title = label ? `Редактировать поле: ${label}` : "Редактировать карточку";
+  }
+
+  function runLocalValidation(rows, products) {
+    const result = emptyResult();
+    const dimensionGroups = [
+      { label: "Габариты ВхШхГ", composite: /габаритные?\s+размеры?\s*\(?\s*в\s*(?:x|х)?\s*ш\s*(?:x|х)?\s*г/i, parts: [/^высота(?:,|\s)/, /^ширина(?:,|\s)/, /^глубина(?:,|\s)/] },
+      { label: "Размеры в упаковке ВхШхГ", composite: /размеры?\s+в\s+упаковке?\s*\(?\s*в\s*(?:x|х)?\s*ш\s*(?:x|х)?\s*г/i, parts: [/^высота\s+упаковки/, /^ширина\s+упаковки/, /^глубина\s+упаковки/] },
+    ];
+
+    dimensionGroups.forEach((definition) => {
+      const composite = findRow(rows, definition.composite);
+      if (!composite) return;
+      const parts = definition.parts.map((pattern) => findRow(rows, pattern));
+
+      composite.values.forEach((value, index) => {
+        if (parts.some((row) => !row)) return;
+
+        const parsed = parseDimensionParts(value);
+        const separate = parts.map((row) => row.values[index] || "");
+        const complete = parsed.length === 3 && parsed.every((part) => part.length > 0) && separate.every((item) => numberOf(item) !== null);
+
+        if (!complete) return;
+
+        const localMeta = { dimension: true, order: dimensionSourceOrder(composite.title), title: composite.title };
+        const matches = [0, 1, 2].map((partIndex) => compareNumberPart(
+          parsed[partIndex].join(" "), separate[partIndex],
+          unitsForLabel(composite.title, value), unitsForLabel(parts[partIndex].title, separate[partIndex]),
+        ));
+
+        const status = matches.every((item) => item === true) ? "ok" : "error";
+        if (status !== "ok") {
+            const message = `${definition.label}: составное значение не совпадает с отдельными полями у ${productLabel(products, index)}`;
+            const tooltip = `Локально: ${value} != ${separate.join(' x ')}`;
+            [composite, ...parts].forEach((row) => noteResult(result, row, index, status, message, tooltip));
+        }
+      });
+    });
+
+    rows.forEach((row) => {
+      row.values.forEach((value, index) => {
+        const issues = dimensionFormatIssues(value, row.title);
+        if (!issues.length) return;
+        const message = `${row.title}: ${issues.join("; ")} у ${productLabel(products, index)}`;
+        noteResult(result, row, index, "error", message, issues.join("; "), "", true, {
+          label: row.title,
+          value: `${value || "пусто"}; ${issues.join("; ")}`,
+        });
+      });
+    });
+
+    const typeRow = findRow(rows, /^тип$|^вид$/);
+    const gasBurnerRow = findRow(rows, /конфорок\s+газовых/);
+    const ignitionRow = findRow(rows, /электроподжиг/);
+    if (ignitionRow && (typeRow || gasBurnerRow)) {
+      ignitionRow.values.forEach((value, index) => {
+        const isGasByType = /газ/.test(normalize(typeRow?.values[index]));
+        const gasCount = numberOf(gasBurnerRow?.values[index]);
+        const isGasByCount = gasCount !== null && gasCount > 0;
+        if (!isGasByType && !isGasByCount) return;
+        if (isMissing(value) || isNegative(value)) {
+          const message = `Электроподжиг: у газовой панели не должно быть «Нет» или пустого значения (${productLabel(products, index)})`;
+          noteResult(result, ignitionRow, index, "error", message, "У газовой панели должен быть электроподжиг");
+        }
+      });
+    }
+    return result;
+  }
+
+  function requestHtml(url) {
+    const gmRequest = typeof GM_xmlhttpRequest === "function"
+      ? GM_xmlhttpRequest
+      : (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function" ? GM.xmlHttpRequest : null);
+    if (gmRequest) {
+      return new Promise((resolve, reject) => {
+        gmRequest({
+          method: "GET", url, timeout: 30000,
+          onload: (response) => {
+            if (response.status >= 200 && response.status < 400) resolve(response.responseText);
+            else reject(new Error(`HTTP ${response.status}`));
+          },
+          ontimeout: () => reject(new Error("тайм-аут запроса")),
+          onerror: () => reject(new Error("ошибка сетевого запроса")),
+        });
+      });
+    }
+    return fetch(url, { credentials: "omit" }).then((response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.text();
+    });
+  }
+
+  const WEB_SEARCH_ENGINES = [
+    {
+      name: "DuckDuckGo",
+      buildUrl: (query) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+      rowSelector: ".result",
+      titleSelector: ".result__a",
+      snippetSelector: ".result__snippet",
+    },
+    {
+      name: "Bing",
+      buildUrl: (query) => `https://www.bing.com/search?q=${encodeURIComponent(query)}&count=5`,
+      rowSelector: "li.b_algo",
+      titleSelector: "h2 a",
+      snippetSelector: ".b_caption p, .b_paractl",
+    },
+  ];
+
+  function searchText(element) {
+    return String(element?.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function searchResultUrl(href, baseUrl) {
+    try {
+      const url = new URL(href, baseUrl);
+      const redirected = url.searchParams.get("uddg");
+      return redirected ? decodeURIComponent(redirected) : url.href;
+    } catch (_) {
+      return href || "";
+    }
+  }
+
+  function parseWebSearchResults(html, engine) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    return [...doc.querySelectorAll(engine.rowSelector)]
+      .map((row) => {
+        const link = row.querySelector(engine.titleSelector);
+        const snippet = row.querySelector(engine.snippetSelector);
+        const title = searchText(link);
+        const text = searchText(snippet);
+        const url = searchResultUrl(link?.getAttribute("href") || "", engine.buildUrl(""));
+        return { title, snippet: text, url };
+      })
+      .filter((item) => {
+        try { return new URL(item.url).hostname !== "gorenje-ru.ru" && !new URL(item.url).hostname.endsWith(".gorenje-ru.ru"); }
+        catch (_) { return true; }
+      })
+      .filter((item) => item.title || item.snippet)
+      .slice(0, 5);
+  }
+
+  async function searchWebSnippets(query) {
+    const key = normalize(query);
+    if (webSearchCache.has(key)) return webSearchCache.get(key);
+
+    const request = (async () => {
+      const failures = [];
+      let lastSearchUrl = "";
+      for (const engine of WEB_SEARCH_ENGINES) {
+        const searchUrl = engine.buildUrl(query);
+        lastSearchUrl = searchUrl;
+        try {
+          const html = await requestHtml(searchUrl);
+          const results = parseWebSearchResults(html, engine);
+          if (results.length) return { query, engine: engine.name, searchUrl, results };
+          failures.push(`${engine.name}: пустая выдача`);
+        } catch (error) {
+          failures.push(`${engine.name}: ${String(error.message || error)}`);
+        }
+      }
+      return { query, engine: "", searchUrl: lastSearchUrl, results: [], error: failures.join("; ") };
+    })();
+
+    webSearchCache.set(key, request);
+    return request;
+  }
+
+  function webValueWords(value) {
+    const ignored = new Set(["да", "нет", "есть", "шт", "см", "мм", "кг", "л", "вт", "квт", "квтч", "м", "г"]);
+    return normalize(value)
+      .replace(/\d+(?:\.\d+)?/g, " ")
+      .replace(/[^a-zа-яё]+/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length >= 3 && !ignored.has(word));
+  }
+
+  function webEvidenceMatches(localValue, localTitle, result) {
+    const haystack = normalize(result.snippet);
+    const localNumbers = numbersOf(localValue);
+    const webNumbers = numbersOf(haystack);
+    const isDimension = /(?:размер|габарит|высот|ширин|глубин|ниши|упаковк)/.test(normalizeLabel(localTitle));
+    const numbersMatch = localNumbers.every((number) => webNumbers.some((candidate) =>
+      Math.abs(number - candidate) < 0.01
+      || (isDimension && (Math.abs(number * 10 - candidate) < 0.1 || Math.abs(number - candidate * 10) < 0.1))
+    ));
+    if (localNumbers.length && !numbersMatch) return false;
+
+    const words = webValueWords(localValue);
+    if (!words.length) return localNumbers.length > 0;
+    const wordHits = words.filter((word) => haystack.includes(word)).length;
+    return wordHits >= Math.max(1, Math.ceil(words.length / 2));
+  }
+
+  function webSnippetLabel(result) {
+    const text = [result?.title, result?.snippet].filter(Boolean).join(": ") || "Текстового сниппета нет";
+    return text.length > 900 ? `${text.slice(0, 897)}…` : text;
+  }
+
+  function webEvidenceLabel(evidence) {
+    const snippet = webSnippetLabel(evidence.result);
+    return evidence.error && !evidence.result ? `${snippet}; ${evidence.error}` : snippet;
+  }
+
+  async function findWebEvidence(product, localTitle, localValue) {
+    const model = product?.model || modelCandidates(product)[0] || "";
+    if (!model) return { available: false, reason: "модель товара не определена" };
+
+    const query = `Gorenje ${model} ${String(localTitle || "").trim()} -site:gorenje-ru.ru`.trim();
+    const search = await searchWebSnippets(query);
+    const matched = search.results.find((result) => webEvidenceMatches(localValue, localTitle, result)) || null;
+    return {
+      available: true,
+      matched: Boolean(matched),
+      query,
+      engine: search.engine,
+      searchUrl: search.searchUrl,
+      result: matched || search.results.find((item) => item.snippet || item.title) || null,
+      error: search.error || "",
+    };
+  }
+
+  function requestBinary(url) {
+    const gmRequest = typeof GM_xmlhttpRequest === "function"
+      ? GM_xmlhttpRequest
+      : (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function" ? GM.xmlHttpRequest : null);
+    if (gmRequest) {
+      return new Promise((resolve, reject) => {
+        gmRequest({
+          method: "GET", url, timeout: 45000, responseType: "arraybuffer",
+          onload: (response) => {
+            if (response.status >= 200 && response.status < 400 && response.response) resolve(response.response);
+            else reject(new Error(`HTTP ${response.status}`));
+          },
+          ontimeout: () => reject(new Error("тайм-аут загрузки PDF")),
+          onerror: () => reject(new Error("ошибка загрузки PDF")),
+        });
+      });
+    }
+    return fetch(url, { credentials: "omit" }).then((response) => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.arrayBuffer();
+    });
+  }
+
+  async function extractPdfText(buffer) {
+    const pdfjs = globalThis.pdfjsLib || (typeof unsafeWindow !== "undefined" ? unsafeWindow.pdfjsLib : null);
+    if (!pdfjs?.getDocument) return "";
+    const documentTask = pdfjs.getDocument({ data: new Uint8Array(buffer), disableWorker: true });
+    const pdf = await documentTask.promise;
+    const pages = [];
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent();
+      pages.push(content.items.map((item) => item.str).join("\n"));
+    }
+    return pages.join("\n");
+  }
+
+  function manualLines(text) {
+    return String(text ?? "")
+      .replace(/\u00a0/g, " ")
+      .split(/\r?\n/)
+      .map((line) => line.replace(/[ \t]+/g, " ").trim())
+      .filter(Boolean);
+  }
+
+  function manualValueAt(lines, index, patterns) {
+    const line = lines[index] || "";
+    let value = line;
+    patterns.some((pattern) => {
+      if (!pattern.test(line)) return false;
+      value = line.replace(pattern, "").replace(/^\s*[:：\-–—]\s*/, "").trim();
+      return true;
+    });
+    const residual = value.replace(/[()[\],:;.\s×xхвшгмс]/gi, "");
+    if (!value || value === line || !residual) value = lines[index + 1] || "";
+    return value.replace(/^\s*[:：\-–—]\s*/, "").replace(/\s+/g, " ").trim();
+  }
+
+  function parseManualEntries(text, url, category) {
+    const lines = manualLines(text);
+    const profile = categoryProfile(category);
+    const fields = [...MANUAL_COMMON_FIELDS, ...profile.fields];
+    const entries = [];
+    const seen = new Set();
+    fields.forEach((field) => {
+      const index = lines.findIndex((line) => field.patterns.some((pattern) => pattern.test(line)));
+      if (index < 0) return;
+      const value = manualValueAt(lines, index, field.patterns);
+      if (!value || value === lines[index] || value.length > 180) return;
+      const entry = {
+        group: `manual-${profile.key}`,
+        label: field.label,
+        value: formatOfficialValue(value, `${lines[index]} ${field.label}`),
+        sourceUrl: url,
+        sourceType: "pdf",
+        categories: [profile.key],
+      };
+      const key = `${entry.label}|${entry.value}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        entries.push(entry);
+      }
+    });
+    return entries;
+  }
+
+  async function loadManualSources(record, product) {
+    const manualUrls = [...new Set(record.manualUrls || [])].slice(0, 4);
+    if (!manualUrls.length) return { ...record, manualUrls: [], manualEntries: [] };
+    const parsed = await Promise.all(manualUrls.map(async (url) => {
+      try {
+        const buffer = await requestBinary(url);
+        const text = await extractPdfText(buffer);
+        return parseManualEntries(text, url, product.category);
+      } catch (error) {
+        console.warn("[GCV] PDF-инструкция не обработана", url, error);
+        return [];
+      }
+    }));
+    const manualEntries = parsed.flat().map((entry) => {
+      const meta = dimensionMeta(entry.label);
+      const parts = parseDimensionParts(entry.value);
+      return meta && parts.length === 3
+        ? { ...entry, ...meta, isDimensionComposite: true }
+        : entry;
+    });
+    return {
+      ...record,
+      manualUrls,
+      manualEntries,
+      entries: [...record.entries, ...manualEntries],
+      category: product.category,
+    };
+  }
+
+  function foldHomoglyphs(value) {
+    return String(value ?? "").replace(/[АаВвЕеКкМмНнОоРрСсТтХх]/g, (letter) => ({
+      А: "A", а: "a", В: "B", в: "b", Е: "E", е: "e", К: "K", к: "k", М: "M", м: "m",
+      Н: "H", н: "h", О: "O", о: "o", Р: "P", р: "p", С: "C", с: "c", Т: "T", т: "t", Х: "X", х: "x",
+    }[letter] || letter));
+  }
+
+  function featureKey(value) {
+    return normalize(value)
+      .replace(/multi\s*flow/g, "multiflow")
+      .replace(/fresh\s*zone/g, "crispzone")
+      .replace(/steam\s*tech/g, "steamtech")
+      .replace(/senso\s*care/g, "sensocare")
+      .replace(/twin\s*air/g, "twinair")
+      .replace(/fast\s*freeze/g, "fastfreeze")
+      .replace(/super\s*cool/g, "supercool")
+      .replace(/adapt\s*tech/g, "adapttech")
+      .replace(/convert\s*active/g, "convertactive")
+      .replace(/aqua\s*clean/g, "aquaclean")
+      .replace(/silver\s*matte/g, "silvermatte")
+      .replace(/big\s*space/g, "bigspace")
+      .replace(/compact\s*door/g, "compactdoor")
+      .replace(/[^a-zа-яё0-9]/g, "");
+  }
+
+  function featureNameMatches(localTitle, localValue, officialName) {
+    const local = featureKey(`${localTitle} ${localValue}`);
+    const official = featureKey(officialName);
+    if (!local || !official) return false;
+    if (official.length >= 5 && (local.includes(official) || official.includes(local))) return true;
+
+    const ignored = new Set(["тип", "система", "функция", "технология", "контейнер", "зона", "режим", "работа"]);
+    return normalize(officialName)
+      .split(/[^a-zа-яё0-9]+/)
+      .filter(token => token.length >= 3 && !ignored.has(token))
+      .some(token => featureKey(localTitle).includes(featureKey(token)) || featureKey(localValue).includes(featureKey(token)));
+  }
+
+  function compactModel(value) {
+    return foldHomoglyphs(value).toLowerCase().replace(/[^a-z0-9]/g, "").toUpperCase();
+  }
+
+  function modelMatches(value, model) {
+    const haystack = compactModel(value);
+    const needle = compactModel(model);
+    return needle.length >= 4 && (haystack.includes(needle) || needle.includes(haystack));
+  }
+
+  function modelCandidates(product) {
+    const candidates = new Set();
+    const add = (value) => {
+      const model = String(value ?? "").trim().replace(/\s+/g, "").toUpperCase();
+      if (/^\d{4,}$/.test(model)) {
+        candidates.add(model);
+        return;
+      }
+      if (!/[A-ZА-Я]\d/.test(model) && !/\d[A-ZА-Я]/.test(model)) return;
+      if (compactModel(model).length < 4) return;
+      candidates.add(model);
+      candidates.add(compactModel(model));
+    };
+    const extract = (value) => {
+      const matches = String(value ?? "").match(/\b[A-Za-zА-Яа-я]{1,8}\s*[-\/]?\s*\d{1,6}(?:\s*[-\/]?\s*[A-Za-z0-9А-Яа-я]{1,12}){0,3}\b/g) || [];
+      matches.forEach(add);
+    };
+
+    // Сначала берём H1: именно там сохраняются значимые суффиксы вроде «/C».
+    extract(product.name);
+    extract(product.href);
+    if (product.article && /^\d{4,}$/.test(String(product.article).trim())) add(product.article);
+    return [...candidates];
+  }
+
+  function isOfficialProductUrl(href) {
+    try {
+      const url = new URL(href, OFFICIAL_ORIGIN);
+      const parts = url.pathname.split("/").filter(Boolean);
+      return url.origin === OFFICIAL_ORIGIN
+        && parts[0] === "products"
+        && parts.length >= 4
+        && !url.pathname.includes("/compare/")
+        && !url.pathname.includes("/filter/");
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function officialSearchCandidates(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    return [...new Map([...doc.querySelectorAll("a[href]")]
+      .map((link) => ({
+        text: textOf(link),
+        href: new URL(link.getAttribute("href"), OFFICIAL_ORIGIN).href,
+      }))
+      .filter((item) => isOfficialProductUrl(item.href))
+      .map((item) => [item.href, item])).values()];
+  }
+
+  async function findOfficialUrl(product) {
+    const models = modelCandidates(product);
+    const searched = new Set();
+    for (const model of models) {
+      const searchUrl = `${OFFICIAL_ORIGIN}/search/?q=${encodeURIComponent(model)}`;
+      if (searched.has(searchUrl)) continue;
+      searched.add(searchUrl);
+      try {
+        const html = await requestHtml(searchUrl);
+        const candidates = officialSearchCandidates(html);
+        const exact = candidates.find((item) => modelMatches(`${item.text} ${item.href}`, model));
+        if (exact) return { url: exact.href, model };
+        // Поисковая выдача уже отфильтрована точным запросом. Разрешаем один результат,
+        // даже если модель спрятана в служебной части URL.
+        if (candidates.length === 1 && compactModel(model).length >= 5) {
+          return { url: candidates[0].href, model };
+        }
+      } catch (error) {
+        console.warn("[GCV] Search failed for", model, error);
+      }
+    }
+    return null;
+  }
+
+  function dimensionMeta(label) {
+    const key = normalizeLabel(label);
+    if (/монтажные\s+размеры|размер(?:ы)?\s+ниши/.test(key)) {
+      return { dimensionKind: "niche", dimensionOrder: ["height", "width", "depth"], composite: true };
+    }
+    if (/размеры\s+в\s+упаковке/.test(key)) {
+      return { dimensionKind: "package", dimensionOrder: ["height", "width", "depth"], composite: true };
+    }
+    if (/размеры\s*\(?\s*ш\s*x\s*в\s*x\s*г|габаритные\s+размеры|^размеры$/.test(key)) {
+      return { dimensionKind: "main", dimensionOrder: ["height", "width", "depth"], composite: true };
+    }
+    return null;
+  }
+
+  function dimensionPartMeta(label) {
+    const key = normalizeLabel(label);
+    const part = /(?:^|\s)ширина(?:\s|$)/.test(key)
+      ? "width"
+      : /(?:^|\s)высота(?:\s|$)/.test(key)
+        ? "height"
+        : /(?:^|\s)глубина(?:\s|$)/.test(key)
+          ? "depth"
+          : "";
+    if (!part) return null;
+    const kind = /упаковк/.test(key) ? "package" : /ниши|монтаж/.test(key) ? "niche" : "main";
+    return { dimensionKind: kind, dimensionPart: part };
+  }
+
+  function localDimensionMeta(label, value = "") {
+    const key = normalizeLabel(label);
+    const order = dimensionSourceOrder(label);
+    if (/размеры?\s+в\s+упаковке|размеры?\s+упаковки/.test(key)) {
+      return { dimension: true, kind: "package", order, title: label };
+    }
+    if (/размер(?:ы)?\s+ниши|монтажные\s+размеры/.test(key)) {
+      return { dimension: true, kind: "niche", order, title: label };
+    }
+    if (/(?:габаритные?\s+размеры?|габариты|^размеры?$)/.test(key)) {
+      return { dimension: true, kind: "main", order, title: label };
+    }
+
+    const part = key.startsWith("высота") ? "height" : key.startsWith("ширина") ? "width" : key.startsWith("глубина") ? "depth" : "";
+    if (!part) return null;
+    const kind = key.includes("упаковки") ? "package" : key.includes("ниши") ? "niche" : "main";
+    return { dimension: true, kind, part, title: label };
+  }
+
+  function parseOfficialPage(html, url) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const entries = [];
+    const seen = new Set();
+
+    const addEntry = (entry) => {
+      const sourceUnit = entry.unit || unitInfo(entry.label) || unitInfo(entry.value) || null;
+      const formattedEntry = {
+        ...entry,
+        unit: normalizedDimensionUnit(sourceUnit, entry.label),
+        value: formatOfficialValue(entry.value, entry.label),
+      };
+      const key = `${formattedEntry.group}|${formattedEntry.label}|${formattedEntry.value}|${formattedEntry.dimensionPart || ""}`;
+      if (!formattedEntry.label || seen.has(key)) return null;
+      seen.add(key);
+      const record = { sourceUrl: url, sourceType: "html", ...formattedEntry };
+      entries.push(record);
+      return record;
+    };
+
+    const clean = (element) => {
+        if (!element) return "";
+        const parts = element.querySelectorAll('.part');
+        if (parts.length > 0) {
+            return Array.from(parts).map(p => p.textContent.trim()).join(" ").replace(/\s+/g, " ").trim();
+        }
+        return String(element.innerText || "").replace(/\s+/g, " ").trim();
+    };
+
+    const title = clean(doc.querySelector(".products-detail__h1") || doc.querySelector("h1"));
+
+    doc.querySelectorAll(".products-detail__main-props-list-item").forEach((item) => {
+      addEntry({
+        group: "summary",
+        label: clean(item.querySelector(".products-detail__main-props-list-item-name")),
+        value: clean(item.querySelector(".products-detail__main-props-list-item-val")),
+      });
+    });
+
+    doc.querySelectorAll(".products-detail__tech-groups-list-item").forEach((item) => {
+      const groupName = clean(item.closest(".products-detail__tech-group")?.querySelector(".products-detail__tech-groups-title")) || "tech";
+      addEntry({
+        group: groupName,
+        label: clean(item.querySelector(".products-detail__tech-groups-list-item-name")),
+        value: clean(item.querySelector(".products-detail__tech-groups-list-item-val")),
+      });
+    });
+
+    const features = [...doc.querySelectorAll(".products-detail__advantages-item")].map((item) => ({
+      subtitle: clean(item.querySelector(".products-detail__advantages-subtitle")),
+      title: clean(item.querySelector(".products-detail__advantages-title")),
+      text: clean(item.querySelector(".products-detail__advantages-text")),
+    }));
+
+    const featureNames = [...new Set([
+      ...[...doc.querySelectorAll(".products-detail__advantages-thumbs-item-text")].map(clean),
+      ...features.flatMap((item) => [item.subtitle, item.title]),
+    ].filter(Boolean))];
+    const manualUrls = [...new Set([...doc.querySelectorAll("a[href], [data-href], [data-url]")]
+      .map((element) => element.href || element.dataset.href || element.dataset.url || "")
+      .map((href) => {
+        try { return new URL(href, url).href; } catch (_) { return ""; }
+      })
+      .filter((href) => /\.pdf(?:$|[?#])/i.test(href)))];
+    const official = {
+      url,
+      title,
+      entries,
+      features,
+      featureNames,
+      featureText: [...featureNames, ...features.map((item) => `${item.subtitle} ${item.title} ${item.text}`)].join(" "),
+      manualUrls,
+    };
+
+    entries.forEach((entry) => {
+      const partMeta = dimensionPartMeta(entry.label);
+      if (!partMeta) return;
+      entry.dimensionKind = partMeta.dimensionKind;
+      entry.dimensionPart = partMeta.dimensionPart;
+    });
+
+    const dimensionEntries = [];
+    entries.forEach((entry) => {
+      const meta = dimensionMeta(entry.label);
+      const parts = parseDimensionParts(entry.value);
+      if (!meta || parts.length !== 3 || parts.some((part) => !part.length)) return;
+      entry.dimensionKind = meta.dimensionKind;
+      entry.dimensionOrder = meta.dimensionOrder;
+      entry.isDimensionComposite = true;
+      meta.dimensionOrder.forEach((partName, index) => {
+        dimensionEntries.push({
+          group: entry.group, label: `derived ${meta.dimensionKind} ${partName}`, anchorLabel: entry.label, value: parts[index].join("-"),
+          dimensionKind: meta.dimensionKind, dimensionPart: partName, unit: entry.unit || unitInfo(entry.value) || unitInfo(entry.label), derived: true,
+        });
+      });
+    });
+    dimensionEntries.forEach(addEntry);
+
+    ["main", "package", "niche"].forEach((kind) => {
+      if (entries.some((entry) => entry.dimensionKind === kind && entry.isDimensionComposite)) return;
+      const byPart = Object.fromEntries(entries
+        .filter((entry) => entry.dimensionKind === kind && entry.dimensionPart)
+        .map((entry) => [entry.dimensionPart, entry]));
+      if (!(byPart.width && byPart.height && byPart.depth)) return;
+
+      const sourceEntries = [byPart.width, byPart.height, byPart.depth];
+      const unit = sourceEntries.find((entry) => entry.unit)?.unit || null;
+      const label = kind === "main"
+        ? "Габаритные размеры (ШхВхГ)"
+        : kind === "package"
+          ? "Размеры в упаковке (ШхВхГ)"
+          : "Монтажные размеры (ШхВхГ)";
+      const composite = addEntry({
+        group: "derived",
+        label,
+        value: sourceEntries.map((entry) => entry.value).join(" х "),
+        unit,
+      });
+      if (composite) {
+        composite.dimensionKind = kind;
+        composite.dimensionOrder = ["height", "width", "depth"];
+        composite.isDimensionComposite = true;
+      }
+    });
+    official.entries = entries;
+    return official;
+  }
+
+  // ==========================================
+  // НЕЧЕТКИЙ ПОИСК
+  // ==========================================
+  const STOP_WORDS = new Set([
+    "количество", "тип", "материал", "цвет", "размер", "вес", "класс", "форма",
+    "система", "наличие", "есть", "нет", "да", "объем", "мощность", "покрытие",
+    "дверца", "панель", "управление", "переключатели", "программатор", "таймер",
+    "освещение", "шарнир", "решетка", "противень", "ящик", "плита", "духовка",
+    "варочная", "поверхность", "шкаф", "электрическая", "газовая", "индукционная"
+  ]);
+
+  const SEMANTIC_BLACKLIST = [
+    { local: /тип/i, forbidden: [/ящик/, /мощность/, /вес/, /размер/, /объем/, /потреблен/, /напряжен/, /частот/, /покрыт/, /цвет/, /материал/, /форм/, /класс/, /дверц/, /шарнир/, /решетк/, /противен/, /конфорк/] },
+    { local: /мощность/i, forbidden: [/тип/, /ящик/, /вес/, /размер/, /объем/, /класс/, /покрыт/, /цвет/, /материал/, /конфорк/] },
+    { local: /вес/i, forbidden: [/тип/, /ящик/, /мощность/, /размер/, /объем/, /класс/, /покрыт/, /цвет/] },
+    { local: /размер|габарит|высота|ширина|глубина/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /объем/, /класс/, /покрыт/, /цвет/] },
+    { local: /объем/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /класс/, /покрыт/, /цвет/, /форм/] },
+    { local: /класс/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /покрыт/, /цвет/] },
+    { local: /цвет/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/, /материал/, /покрыт/, /управл/] },
+    { local: /материал/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/, /цвет/, /форм/, /управл/] },
+    { local: /покрыт/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/, /цвет/, /материал/] },
+    { local: /страна/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/] },
+    { local: /управление|переключател|таймер|программатор/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/, /цвет/, /материал/] },
+    { local: /освещен|подсветк/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/] },
+    { local: /дверц|стекл|шарнир/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/, /цвет/, /материал/, /конфорк/] },
+    { local: /очистк|пар|пиролит|каталит/i, forbidden: [/тип/, /ящик/, /мощность/, /вес/, /размер/, /объем/, /класс/] },
+    { local: /противен|решетк|ящик|комплект|оборудован/i, forbidden: [/тип/, /мощность/, /вес/, /размер/, /объем/, /класс/, /цвет/, /материал/, /конфорк/] },
+    { local: /конфорк|зона\s+нагрева/i, forbidden: [/тип/, /ящик/, /вес/, /размер/, /объем/, /класс/, /цвет/, /материал/, /дверц/, /стекл/] },
+  ];
+
+  function isSemanticallyCompatible(localTitle, officialLabel) {
+    const localNorm = normalize(localTitle);
+    const officialNorm = normalize(officialLabel);
+    for (const rule of SEMANTIC_BLACKLIST) {
+        if (rule.local.test(localNorm)) {
+            for (const forbidden of rule.forbidden) {
+                if (forbidden.test(officialNorm)) return false;
+            }
+        }
+    }
+    return true;
+  }
+
+  function similarityScore(strA, strB) {
+    if (!isSemanticallyCompatible(strA, strB)) return 0;
+    if (canonicalLabel(strA) === canonicalLabel(strB)) return 1;
+
+    const a = normalizeLabel(strA).split(/\s+/).filter(t => t.length > 2 && !STOP_WORDS.has(t));
+    const b = normalizeLabel(strB).split(/\s+/).filter(t => t.length > 2 && !STOP_WORDS.has(t));
+    if (!a.length || !b.length) return 0;
+
+    const units = ["квт", "квтч", "вт", "мм", "см", "кг", "л", "град", "об", "мин"];
+    const aUnits = a.filter(t => units.some(u => t.includes(u)));
+    const bUnits = b.filter(t => units.some(u => t.includes(u)));
+
+    if (aUnits.length > 0 && bUnits.length > 0) {
+        const bUnitSet = new Set(bUnits);
+        if (!aUnits.some(u => bUnitSet.has(u))) return 0;
+    } else if (aUnits.length > 0 || bUnits.length > 0) {
+        if (!/габарит|размер|высота|ширина|глубина/i.test(strA + strB)) return 0;
+    }
+
+    const tokenKey = (token) => foldHomoglyphs(token).toLowerCase();
+    const setB = new Set(b.map(tokenKey));
+    const intersection = a.filter(token => setB.has(tokenKey(token)));
+    if (intersection.length === 0) return 0;
+
+    const matchWeight = intersection.reduce((sum, t) => sum + t.length, 0);
+    const totalUniqueTokens = [...new Set([...a, ...b])];
+    const totalWeight = totalUniqueTokens.reduce((sum, t) => sum + t.length, 0);
+
+    return totalWeight ? matchWeight / totalWeight : 0;
+  }
+
+  function labelDescriptor(label, value = "") {
+    const key = normalizeLabel(label);
+    const descriptor = { labels: [], featureTerms: [], valueHint: "" };
+
+    if (FIELD_MAPPING[key]) {
+        descriptor.labels = FIELD_MAPPING[key];
+        return descriptor;
+    }
+
+    if (key.includes("дисплей")) descriptor.labels = [/^дисплей/, /^цифровой дисплей/];
+    else if (key.includes("загрузка") && key.includes("кг")) descriptor.labels = [/^загрузка при сушке/, /^загрузка/, /^максимальная загрузка/];
+    else if (key.includes("сенсор влажности")) {
+        descriptor.labels = [/^сенсоры$/];
+        descriptor.valueHint = "влажности";
+    }
+    else if (["хлопок", "шерсть", "синтетика", "спорт", "деликат", "рубаш", "постель", "быстр", "пухов", "детск", "микс", "антиаллерг", "экстрагигиен"].some(p => key.includes(p))) {
+        descriptor.labels = [/^(?:основные|специальные|режимы) программы/, /^программы сушки$/, /^программы$/];
+        descriptor.valueHint = key.split(' ')[0];
+    }
+    else if (key.includes("размеры в упаковке") || key.includes("размер ниши") || key.includes("габариты") || /^высота|^ширина|^глубина/.test(key)) {
+      descriptor.labels = [new RegExp(`^${key.replace(/\s+(см|мм|\(.*\))$/, "").trim()}$`)];
+    }
+    else if (/(?:особенност|функц|технолог|создан.*собственн|личн.*параметр)/.test(key)) {
+         descriptor.featureTerms = [key.replace(/\s*\(.*\)/, "").replace(/,\s*шт$/, "").trim()];
+    }
+    else if (key.includes("нагрев") || key.includes("гриль") || key.includes("пар") || key.includes("сушка") ||
+             key.includes("пицца") || key.includes("размораживание") || key.includes("регенерац") ||
+             key.includes("сувид") || key.includes("air fry") || key.includes("gratin") ||
+             key.includes("frozen bake") || key.includes("slow bake") || key.includes("adapt bake") ||
+             key.includes("multi steam") || key.includes("pure steam") || key.includes("home made") ||
+             key.includes("big space") || key.includes("super size") || key.includes("connectlife") ||
+             key.includes("totaldry") || key.includes("aquastop") || key.includes("steamtech") ||
+             key.includes("twin air") || key.includes("no frost") || key.includes("fresh zone") ||
+             key.includes("bigspace") || key.includes("supersize") || key.includes("extrasteam") ||
+             key.includes("perfect grill") || key.includes("вариогриль") || key.includes("compact door") ||
+             key.includes("aqua clean") || key.includes("silver matte") || key.includes("ecoclean")) {
+        descriptor.featureTerms = [key.replace(/\s*\(.*\)/, "").replace(/,\s*шт$/, "").trim()];
+    }
+    else {
+        descriptor.labels = [new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`)];
+    }
+
+    return descriptor;
+  }
+
+  function relevantOfficialEntries(official, category) {
+    return (official.entries || []).filter((entry) => !entry.categories?.length || !category || entry.categories.includes(category));
+  }
+
+  function findReference(localTitle, localValue, official, category = "") {
+    const zoneKey = normalizeLabel(localTitle);
+    const entries = relevantOfficialEntries(official, category);
+    if (zoneKey === "размеры" && parseDimensionParts(localValue).length !== 3) return null;
+    const zoneSide = /^(передняя|задняя)(?:\s|,)/.exec(zoneKey)?.[1];
+    if (zoneSide && !/левая|правая/.test(zoneKey) && numbersOf(localValue).length >= 2) {
+      const diameter = entries.find((entry) => {
+        const label = normalizeLabel(entry.label);
+        return new RegExp(`^ø\\s*${zoneSide}`).test(label) || new RegExp(`^${zoneSide}.*мм$`).test(label);
+      });
+      const power = entries.find((entry) => new RegExp(`^мощность ${zoneSide === "передняя" ? "передн" : "задн"}`).test(normalizeLabel(entry.label)));
+      if (diameter && power) {
+        return {
+          entry: {
+            label: `${diameter.label} + ${power.label}`,
+            value: `${diameter.value}; ${power.value}`,
+            sourceUrl: official.url,
+            diameter,
+            power,
+          },
+          localMeta: null,
+          kind: "zone",
+        };
+      }
+    }
+
+    const localMeta = localDimensionMeta(localTitle, localValue);
+    if (localMeta) {
+      const candidate = entries.find((entry) =>
+        entry.dimensionKind === localMeta.kind &&
+        (localMeta.part ? entry.dimensionPart === localMeta.part : entry.isDimensionComposite)
+      );
+      if (candidate) return { entry: candidate, localMeta, kind: "spec" };
+      // Размерные строки нельзя передавать в общий нечёткий поиск:
+      // иначе «Нет» в строке ниши может совпасть с названием функции.
+      return null;
+    }
+
+    const localCanonical = canonicalLabel(localTitle);
+    if (localCanonical && localCanonical !== "тип") {
+      const canonicalCandidates = entries.filter((entry) =>
+        canonicalLabel(entry.label) === localCanonical && isSemanticallyCompatible(localTitle, entry.label)
+      );
+      if (canonicalCandidates.length) {
+        const genericVolumeLabels = new Set([
+          "полезный объем",
+          "объем нетто",
+          "объем рабочей камеры",
+          "объем духовки",
+          "объем духового шкафа",
+        ]);
+        const volumeLabel = normalizeLabel(localTitle).replace(/\s+(?:см|мм|кг|л|вт|квт|квтч|шт)$/, "").trim();
+        const isGenericVolume = localCanonical === "usable-volume" && genericVolumeLabels.has(volumeLabel);
+        const hasCompartmentVolumes = entries.some((entry) =>
+          /^объем (?:нетто|брутто) [хм] о/.test(normalizeLabel(entry.label))
+        );
+        const hasValueMatch = canonicalCandidates.some((entry) =>
+          compareWithEntry(localValue, localTitle, entry, localMeta) === true
+        );
+        if (isGenericVolume && hasCompartmentVolumes && !hasValueMatch) return null;
+        canonicalCandidates.sort((first, second) => {
+          const firstMatch = compareWithEntry(localValue, localTitle, first, localMeta) === true ? 1 : 0;
+          const secondMatch = compareWithEntry(localValue, localTitle, second, localMeta) === true ? 1 : 0;
+          return secondMatch - firstMatch || Number(second.group === "summary") - Number(first.group === "summary");
+        });
+        return { entry: canonicalCandidates[0], localMeta, kind: "alias" };
+      }
+    }
+
+    const descriptor = labelDescriptor(localTitle, localValue);
+    let candidates = entries.filter((entry) =>
+        descriptor.labels.some((pattern) => pattern.test(normalizeLabel(entry.label)))
+    );
+
+    if (descriptor.valueHint) {
+      const hinted = candidates.filter((entry) =>
+        new RegExp(descriptor.valueHint, "i").test(normalize(entry.value) + " " + normalize(official.title))
+      );
+      if (hinted.length) candidates = hinted;
+      else if (candidates.length === 0) {
+          const globalHint = entries.find(e => new RegExp(descriptor.valueHint, "i").test(normalize(e.value)));
+          if (globalHint) candidates = [globalHint];
+      }
+    }
+
+    if (candidates.length) {
+      const ranked = candidates.map((entry) => {
+        let valueScore = 0;
+        const valueResult = compareWithEntry(localValue, localTitle, entry, localMeta);
+        if (valueResult === true) valueScore = 100;
+        else if (valueResult === null) valueScore = 5;
+        return {
+          entry,
+          score: valueScore + similarityScore(localTitle, entry.label) + Number(entry.group === "summary") * 0.05,
+        };
+      }).sort((first, second) => second.score - first.score);
+      return { entry: ranked[0].entry, localMeta, kind: "spec" };
+    }
+
+    const galleryFeature = (official.featureNames || []).find((name) =>
+      featureNameMatches(localTitle, localValue, name)
+    );
+    if (galleryFeature) {
+      return {
+        entry: {
+          label: `Функция: ${galleryFeature}`,
+          value: "Да",
+          sourceUrl: official.url,
+          anchorLabel: galleryFeature,
+          featureName: galleryFeature,
+        },
+        localMeta,
+        kind: "feature-gallery",
+      };
+    }
+
+    const scored = entries
+        .map(entry => ({ entry, score: similarityScore(localTitle, entry.label) }))
+        .filter(item => item.score >= 0.58)
+        .sort((a, b) => b.score - a.score);
+
+    if (scored.length > 0 && (scored.length === 1 || scored[0].score - scored[1].score >= 0.12)) {
+        const best = scored[0];
+        console.log(
+            `%c[GCV] Fuzzy match: "${localTitle}" → "${best.entry.label}" (${(best.score * 100).toFixed(0)}%)`,
+            'color: #007f83; font-weight: bold;'
+        );
+        return { entry: best.entry, localMeta, kind: "fuzzy" };
+    }
+
+    const featureText = normalize(official.featureText + " " + entries.map(e => e.value).join(" "));
+    const term = descriptor.featureTerms.find((item) => featureText.includes(normalize(item)));
+    const termTokens = term ? normalize(term).split(/[^a-zа-яё0-9]+/).filter(token => token.length > 3) : [];
+    const localFeatureValue = normalize(localValue);
+    if (term && (isPositive(localValue) || termTokens.some(token => localFeatureValue.includes(token)))) {
+      return {
+        entry: { label: "Упоминание в тексте", value: `Найдено: ${term}`, sourceUrl: official.url },
+        localMeta,
+        kind: "feature"
+      };
+    }
+
+    return null;
+  }
+
+  function compareReference(localValue, localTitle, reference) {
+    if (reference.kind === "zone") {
+      const localNumbers = numbersOf(localValue);
+      const diameter = numberOf(reference.entry.diameter.value);
+      const power = numberOf(reference.entry.power.value);
+      const localKey = normalize(localTitle);
+      const localLengthFactor = /см/.test(localKey) ? 10 : 1;
+      const localPowerFactor = /квт/.test(localKey) ? 1000 : 1;
+      const officialDiameterUnit = unitsForLabel(reference.entry.diameter.label, reference.entry.diameter.value);
+      const officialPowerUnit = unitsForLabel(reference.entry.power.label, reference.entry.power.value);
+      return localNumbers.length >= 2 && diameter !== null && power !== null
+        ? Math.abs(localNumbers[0] * localLengthFactor - diameter * officialDiameterUnit.factor) <= 1.5
+          && Math.abs(localNumbers[1] * localPowerFactor - power * officialPowerUnit.factor) <= 10
+        : null;
+    }
+    if (reference.kind === "feature" || reference.kind === "feature-gallery") {
+      if (isPositive(localValue)) return true;
+      if (isNegative(localValue)) return false;
+      if (reference.kind === "feature-gallery") return true;
+      return compareText(localValue, reference.entry.value);
+    }
+    return compareWithEntry(localValue, localTitle, reference.entry, reference.localMeta);
+  }
+
+  async function loadOfficialProduct(product) {
+    try {
+      const found = await findOfficialUrl(product);
+      if (!found) return { error: "модель не найдена на ru.gorenje.com", model: modelCandidates(product)[0] || "" };
+      if (!officialCache.has(found.url)) {
+        officialCache.set(found.url, requestHtml(found.url).then((html) => parseOfficialPage(html, found.url)));
+      }
+      const baseRecord = await officialCache.get(found.url);
+      const manualKey = `${found.url}|${product.category || "generic"}`;
+      if (!manualCache.has(manualKey)) manualCache.set(manualKey, loadManualSources(baseRecord, product));
+      const record = await manualCache.get(manualKey);
+      return { ...record, model: found.model };
+    } catch (error) {
+      return { error: String(error.message || error), model: modelCandidates(product)[0] || "" };
+    }
+  }
+
+  async function runOfficialValidation(rows, products) {
+    const result = emptyResult();
+    const records = await Promise.all(products.map((product) => loadOfficialProduct(product)));
+    const summary = { records, checked: 0, confirmed: 0, mismatches: 0, unknown: 0, skipped: 0, failed: 0, manualSources: 0, manualFields: 0, categories: [], webSearches: 0, webConfirmed: 0, webWarnings: 0 };
+    const webFallbacks = [];
+
+    records.forEach((record, index) => {
+      if (record.error) summary.failed += 1;
+      if (record.url) products[index].officialUrl = record.url;
+      summary.manualSources += record.manualUrls?.length || 0;
+      summary.manualFields += record.manualEntries?.length || 0;
+      if (record.category) summary.categories.push(record.category);
+    });
+
+    rows.forEach((row) => {
+      row.values.forEach((localValue, index) => {
+        const record = records[index];
+        summary.checked += 1;
+        if (["article", "ean", "model"].includes(canonicalLabel(row.title))) {
+          // Артикул на сайте магазина может быть внутренним SKU и не обязан
+          // совпадать с артикулом производителя для той же модели.
+          summary.skipped += 1;
+          return;
+        }
+        if (!record || record.error) {
+          summary.unknown += 1;
+          const message = `⚠️ ОФИЦИАЛЬНЫЙ ИСТОЧНИК: ${row.title} не проверен для ${productLabel(products, index)} (${record?.error || "нет записи"})`;
+          noteResult(result, row, index, "warning", message, "Не найдено на оф. сайте", record?.url || "", true, {
+            label: "Официальный источник",
+            value: record?.error || "Карточка не найдена",
+            source: record?.url || "",
+            anchorLabel: "",
+          });
+          return;
+        }
+        const reference = findReference(row.title, localValue, record, products[index]?.category || record.category);
+        if (!reference) {
+          summary.unknown += 1;
+          webFallbacks.push(findWebEvidence(products[index], row.title, localValue).then((evidence) => {
+            if (!evidence.available) {
+              const message = `⚠️ ОФИЦИАЛЬНЫЙ ИСТОЧНИК: характеристика «${row.title}» не найдена у ${productLabel(products, index)}`;
+              noteResult(result, row, index, "warning", message, "Нет на оф. сайте", record.url, true, {
+                label: row.title,
+                value: `Поле не найдено на официальном сайте; веб-поиск пропущен: ${evidence.reason}`,
+                source: record.url,
+                anchorLabel: row.title,
+              });
+              return;
+            }
+
+            summary.webSearches += 1;
+            const status = evidence.matched ? "ok" : "warning";
+            if (evidence.matched) summary.webConfirmed += 1;
+            else summary.webWarnings += 1;
+            const prefix = evidence.matched ? "✅" : "⚠️";
+            const engine = evidence.engine || "DuckDuckGo/Bing";
+            const snippet = webEvidenceLabel(evidence);
+            const source = evidence.result?.url || evidence.searchUrl || "";
+            const matchText = evidence.matched ? "локальное значение найдено в сниппете" : "локальное значение не найдено в сниппетах";
+            const message = `${prefix} ВЕБ-ПОИСК (${engine}): ${matchText} для «${row.title}» у ${productLabel(products, index)}; локально «${localValue || "пусто"}»`;
+            noteResult(result, row, index, status, message, `Сниппет: ${snippet}`, source, true, {
+              label: `Веб-поиск: ${row.title}`,
+              value: `${snippet}${evidence.query ? `\nЗапрос: ${evidence.query}` : ""}`,
+              source,
+              anchorLabel: "",
+            });
+          }).catch((error) => {
+            summary.webSearches += 1;
+            summary.webWarnings += 1;
+            const message = `⚠️ ВЕБ-ПОИСК: не удалось проверить «${row.title}» у ${productLabel(products, index)}`;
+            noteResult(result, row, index, "warning", message, String(error.message || error), "", true, {
+              label: `Веб-поиск: ${row.title}`,
+              value: `Ошибка поиска: ${String(error.message || error)}`,
+            });
+          }));
+          return;
+        }
+        const comparison = compareReference(localValue, row.title, reference);
+        const status = comparison === null ? "warning" : comparison ? "ok" : "error";
+        if (status === "ok") summary.confirmed += 1;
+        if (status === "error") summary.mismatches += 1;
+        if (status === "warning") summary.unknown += 1;
+
+        const prefix = status === "ok" ? "✅" : status === "error" ? "❌" : "⚠️";
+        const fuzzyMark = reference.kind === "fuzzy" ? " [FUZZY]" : "";
+        const pdfMark = reference.entry.sourceType === "pdf" ? " [PDF]" : "";
+        const shownLabel = displayDimensionLabel(reference.entry.label);
+        const message = `${prefix} ОФИЦИАЛЬНЫЙ ИСТОЧНИК${pdfMark}${fuzzyMark}: «${row.title}» → «${shownLabel}» у ${productLabel(products, index)}; локально «${localValue || "пусто"}», официально «${reference.entry.value || "пусто"}»`;
+        const tooltip = status === "error" ? `На оф. сайте: ${reference.entry.value}` : (status === "warning" ? "Нет на оф. сайте" : "");
+        noteResult(result, row, index, status, message, tooltip, reference.entry.sourceUrl || record.url, true, {
+          label: shownLabel,
+          value: reference.entry.value || "пусто",
+          source: reference.entry.sourceUrl || record.url,
+          anchorLabel: reference.entry.anchorLabel || reference.entry.label,
+        });
+      });
+    });
+
+    await Promise.all(webFallbacks);
+
+    records.forEach((record, index) => {
+      if (!record || record.error || !record.featureNames?.length) return;
+      record.featureNames.forEach((featureName) => {
+        const localMatch = rows.some((row) => featureNameMatches(row.title, row.values[index] || "", featureName));
+        if (!localMatch) {
+          result.findings.push(`⚠️ ОФИЦИАЛЬНАЯ ФУНКЦИЯ: «${featureName}» есть у ${productLabel(products, index)}, но локального поля для сравнения нет`);
+        }
+      });
+    });
+    result.officialSummary = summary;
+    return result;
+  }
+
+  // ИСПРАВЛЕНО: переменная previousCell заменена на previous (причина зависания v0.9)
+  function mergeResults(target, extra) {
+    extra.rowResults.forEach((item, row) => {
+      const previous = target.rowResults.get(row) || { status: "ok", messages: new Set(), tooltips: new Set(), details: [] };
+      if (STATUS_RANK[item.status] > STATUS_RANK[previous.status]) previous.status = item.status;
+      item.messages.forEach((message) => previous.messages.add(message));
+      if (item.tooltips) item.tooltips.forEach(t => previous.tooltips.add(t));
+      (item.details || []).forEach((detail) => addDetail(previous, detail));
+      target.rowResults.set(row, previous);
+    });
+    extra.cellResults.forEach((item, cell) => {
+      const previous = target.cellResults.get(cell) || { status: "ok", messages: new Set(), tooltips: new Set(), sources: new Set(), details: [] };
+      if (STATUS_RANK[item.status] > STATUS_RANK[previous.status]) previous.status = item.status;
+      item.messages.forEach((message) => previous.messages.add(message));
+      if (item.tooltips) item.tooltips.forEach(t => previous.tooltips.add(t));
+      (item.sources || []).forEach((source) => previous.sources.add(source));
+      (item.details || []).forEach((detail) => addDetail(previous, detail));
+      target.cellResults.set(cell, previous);
+    });
+    target.findings.push(...extra.findings);
+    target.officialSummary = extra.officialSummary;
+  }
+
+  let openPopover = null;
+  let popoverListenersReady = false;
+
+  function closePopover() {
+    if (!openPopover) return;
+    openPopover.element.remove();
+    openPopover = null;
+  }
+
+  function copyValue(value, button) {
+    const text = String(value ?? "");
+    return (async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+      }
+      const original = button.textContent;
+      button.textContent = "Скопировано";
+      window.setTimeout(() => { button.textContent = original; }, 1200);
+    })();
+  }
+
+  function ensurePopoverListeners() {
+    if (popoverListenersReady) return;
+    popoverListenersReady = true;
+    document.addEventListener("click", (event) => {
+      if (!openPopover) return;
+      if (event.target.closest(".gcv-popover, .gcv-info-button")) return;
+      closePopover();
+    });
+    window.addEventListener("resize", closePopover);
+    window.addEventListener("scroll", closePopover, true);
+  }
+
+  function showPopover(cell, item, button) {
+    ensurePopoverListeners();
+    closePopover();
+
+    const popover = document.createElement("div");
+    popover.className = "gcv-popover";
+    popover.setAttribute("role", "dialog");
+    const head = document.createElement("div");
+    head.className = "gcv-popover-head";
+    const title = document.createElement("strong");
+    title.textContent = item.status === "error" ? "Расхождение" : "Подробности проверки";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "gcv-popover-close";
+    close.textContent = "×";
+    close.setAttribute("aria-label", "Закрыть подробности");
+    close.addEventListener("click", closePopover);
+    head.append(title, close);
+    popover.appendChild(head);
+
+    const details = item.details || [];
+    if (details.length) {
+      details.forEach((detail) => {
+        const row = document.createElement("div");
+        row.className = "gcv-popover-row";
+        const value = document.createElement("span");
+        value.textContent = `${detail.label ? `${detail.label}: ` : ""}${detail.value || "пусто"}`;
+        row.appendChild(value);
+        if (item.status === "error" && detail.value) {
+          const copy = document.createElement("button");
+          copy.type = "button";
+          copy.className = "gcv-popover-copy";
+          copy.textContent = "Копировать";
+          copy.addEventListener("click", () => copyValue(detail.value, copy));
+          row.appendChild(copy);
+        }
+        popover.appendChild(row);
+      });
+    } else {
+      Array.from(item.messages || []).forEach((message) => {
+        const messageRow = document.createElement("div");
+        messageRow.className = "gcv-popover-message";
+        messageRow.textContent = message;
+        popover.appendChild(messageRow);
+      });
+    }
+
+    const sources = new Set(details.map((detail) => detail.source).filter(Boolean));
+    (item.sources || new Set()).forEach((source) => sources.add(source));
+    const source = sources.values().next().value;
+    if (source) {
+      const link = document.createElement("a");
+      const sourceDetail = details.find((detail) => detail.source);
+      link.href = officialAnchorUrl(source, sourceDetail?.anchorLabel || sourceDetail?.label || "");
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "Перейти к параметру";
+      link.className = "gcv-popover-source";
+      popover.appendChild(link);
+    }
+
+    document.body.appendChild(popover);
+    const buttonRect = button.getBoundingClientRect();
+    const popoverRect = popover.getBoundingClientRect();
+    const left = Math.min(Math.max(8, buttonRect.left), window.innerWidth - popoverRect.width - 8);
+    const below = buttonRect.bottom + 8;
+    const top = below + popoverRect.height <= window.innerHeight - 8
+      ? below
+      : Math.max(8, buttonRect.top - popoverRect.height - 8);
+    popover.style.left = `${left}px`;
+    popover.style.top = `${top}px`;
+    openPopover = { element: popover, button };
+  }
+
+  function removeAnnotations() {
+    closePopover();
+    document.querySelectorAll(".gcv-badge, .gcv-source, .gcv-cell-source, .gcv-info-button, .gcv-edit-card").forEach((item) => item.remove());
+    document.querySelectorAll(ROW_SELECTOR).forEach((row) => {
+      row.classList.remove("gcv-row-error", "gcv-row-warning", "gcv-row-ok");
+    });
+  }
+
+  function renderResults(result, products) {
+    removeAnnotations();
+    result.rowResults.forEach((item, row) => {
+      row.element.classList.add(`gcv-row-${item.status}`);
+    });
+    result.cellResults.forEach((item, cell) => {
+      if (!cell) return;
+      const badge = document.createElement("span");
+      badge.className = `gcv-badge gcv-badge-${item.status}`;
+      badge.textContent = item.status === "error" ? "❌" : item.status === "warning" ? "⚠️" : "✅";
+
+      badge.setAttribute("aria-label", item.status === "error" ? "Расхождение" : item.status === "warning" ? "Предупреждение" : "Проверено");
+      badge.style.cssText = "margin-left:8px; font-size:14px;";
+      cell.append(" ", badge);
+
+      if (item.sources.size > 0) {
+          const url = item.sources.values().next().value;
+          const detail = (item.details || []).find((entry) => entry.source);
+          const link = document.createElement("a");
+          link.className = "gcv-cell-source";
+          link.href = officialAnchorUrl(url, detail?.anchorLabel || detail?.label || "");
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          link.textContent = "↗";
+          link.title = detail?.anchorLabel || detail?.label ? "Перейти к параметру на официальном сайте" : `Открыть источник: ${url}`;
+          link.style.cssText = "margin-left:4px; text-decoration:none; color:#007f83;";
+          cell.append(" ", link);
+      }
+
+      if ((item.details || []).length || item.messages?.size) {
+        const info = document.createElement("button");
+        info.type = "button";
+        info.className = "gcv-info-button";
+        info.textContent = "ℹ";
+        info.setAttribute("aria-label", "Показать подробности проверки");
+        info.addEventListener("click", () => {
+          if (openPopover?.button === info) closePopover();
+          else showPopover(cell, item, info);
+        });
+        cell.append(" ", info);
+      }
+
+      const editBase = products?.[item.productIndex]?.editBase;
+      if (item.status !== "ok" && editBase && item.rowTitle) {
+        const edit = document.createElement("a");
+        edit.className = "gcv-edit-card";
+        edit.href = editUrl(editBase, item.rowTitle);
+        edit.target = "_blank";
+        edit.rel = "noreferrer";
+        edit.textContent = "✏️";
+        edit.title = `Редактировать поле: ${item.rowTitle}`;
+        edit.style.cssText = "margin-left:4px;text-decoration:none;color:#c87900;";
+        cell.append(" ", edit);
+      }
+    });
+  }
+
+  function ensurePanel() {
+    let panel = document.getElementById(PANEL_ID);
+    if (panel) return panel;
+    const style = document.createElement("style");
+    style.textContent = `
+      #${PANEL_ID}{position:fixed;z-index:2147483646;top:14px;right:14px;width:min(430px,calc(100vw - 28px));max-height:calc(100vh - 28px);overflow:auto;background:#fff;color:#17212b;border:1px solid #cfd8dc;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.2);font:14px/1.4 Arial,sans-serif}
+      #${PANEL_ID} .gcv-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 14px;background:#f1f5f6;border-bottom:1px solid #dfe7e9}
+      #${PANEL_ID} .gcv-title{font-weight:700} #${PANEL_ID} .gcv-body{padding:12px 14px}
+      #${PANEL_ID} button{border:1px solid #aebdc2;border-radius:6px;background:#fff;padding:6px 9px;cursor:pointer}
+      #${PANEL_ID} button:hover{background:#eaf5f5} #${PANEL_ID} .gcv-run{background:#007f83;color:#fff;border-color:#007f83}
+      #${PANEL_ID} .gcv-summary{margin:0 0 9px;font-weight:700} #${PANEL_ID} .gcv-note{color:#526168;font-size:12px;margin:8px 0}
+      #${PANEL_ID} .gcv-list{margin:8px 0 0;padding-left:20px;max-height:360px;overflow:auto}
+      #${PANEL_ID} .gcv-list li{margin:0 0 7px} #${PANEL_ID} a{color:#007f83}
+      .gcv-info-button{margin-left:5px;padding:1px 5px!important;border:1px solid #aebdc2;border-radius:4px;background:#fff;color:#007f83;font-size:13px;line-height:1.2;cursor:pointer}
+      .gcv-info-button:hover{background:#eaf5f5}.gcv-popover{position:fixed;z-index:2147483647;width:min(390px,calc(100vw - 16px));max-height:min(70vh,520px);overflow:auto;padding:0;background:#fff;color:#17212b;border:1px solid #aebdc2;border-radius:8px;box-shadow:0 8px 26px rgba(0,0,0,.24);font:13px/1.4 Arial,sans-serif}
+      .gcv-popover-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 11px;background:#f1f5f6;border-bottom:1px solid #dfe7e9}.gcv-popover-close{border:0!important;background:transparent!important;padding:0 3px!important;font-size:20px;line-height:1;color:#526168;cursor:pointer}.gcv-popover-row{display:flex;align-items:flex-start;gap:8px;padding:9px 11px;border-bottom:1px solid #edf1f2}.gcv-popover-row>span{flex:1;min-width:0;word-break:break-word}.gcv-popover-message{padding:9px 11px;white-space:pre-wrap;word-break:break-word}.gcv-popover-copy{padding:4px 7px!important;font-size:11px;line-height:1.2;white-space:nowrap}.gcv-popover-source{display:block;padding:9px 11px;color:#007f83}
+      #${PANEL_ID}.gcv-collapsed .gcv-body{display:none} #${PANEL_ID}.gcv-collapsed{width:auto}
+      .gcv-row-error .compare-table-block__cell, .gcv-row-error .characteristics__property {background-color:rgba(255,72,72,.12)!important}
+      .gcv-row-warning .compare-table-block__cell, .gcv-row-warning .characteristics__property {background-color:rgba(255,193,7,.13)!important}
+      .gcv-row-ok .compare-table-block__cell, .gcv-row-ok .characteristics__property {background-color:rgba(57,181,74,.08)!important}
+    `;
+    document.head.appendChild(style);
+    panel = document.createElement("section");
+    panel.id = PANEL_ID;
+     panel.innerHTML = `<div class="gcv-head"><span class="gcv-title">Расширенная проверка v1.4.0</span><button data-action="toggle">Скрыть</button></div> <div class="gcv-body"><button class="gcv-run" data-action="run">Проверить ещё раз</button><div class="gcv-output">Таблица загружается…</div></div>`;
+    panel.querySelector('[data-action="run"]').addEventListener("click", () => runChecks());
+    panel.querySelector('[data-action="toggle"]').addEventListener("click", (event) => {
+      panel.classList.toggle("gcv-collapsed");
+      event.currentTarget.textContent = panel.classList.contains("gcv-collapsed") ? "Показать" : "Скрыть";
+    });
+    document.body.appendChild(panel);
+    return panel;
+  }
+
+  function renderPanel(result, products, loading = false) {
+    const panel = ensurePanel();
+    const output = panel.querySelector(".gcv-output");
+    const errors = [...result.rowResults.values()].filter((item) => item.status === "error").length;
+    const warnings = [...result.rowResults.values()].filter((item) => item.status === "warning").length;
+    output.replaceChildren();
+
+    const summary = document.createElement("p");
+    summary.className = "gcv-summary";
+    summary.textContent = `Ошибок: ${errors}. Предупреждений: ${warnings}. Проверенных строк: ${result.rowResults.size}.`;
+    output.appendChild(summary);
+
+    if (loading) {
+      const loadingNote = document.createElement("p");
+      loadingNote.className = "gcv-note";
+       loadingNote.textContent = "Загружаю официальные карточки ru.gorenje.com; отсутствующие поля проверю через DuckDuckGo/Bing…";
+      output.appendChild(loadingNote);
+      return;
+    }
+
+    if (result.officialSummary) {
+      const official = document.createElement("p");
+      official.className = "gcv-note";
+      const item = result.officialSummary;
+       const manualNote = item.manualSources ? ` PDF: ${item.manualSources} источника, извлечено полей ${item.manualFields || 0}.` : "";
+        const categoryNote = [...new Set(item.categories || [])].map((category) => categoryProfile(category).label).join(", ");
+        const webNote = item.webSearches ? ` Веб-поиск: подтверждено ${item.webConfirmed}, без совпадения ${item.webWarnings}.` : "";
+        official.textContent = `Официальная проверка: подтверждено ${item.confirmed}, расхождений ${item.mismatches}, нет подтверждения ${item.unknown}, служебных идентификаторов пропущено ${item.skipped || 0}.${manualNote}${webNote}${categoryNote ? ` Категории: ${categoryNote}.` : ""}`;
+      output.appendChild(official);
+    }
+
+    const findings = [...new Set(result.findings)];
+    if (!findings.length) {
+      const ok = document.createElement("p");
+      ok.textContent = "✅ Ошибок по доступным правилам не найдено.";
+      output.appendChild(ok);
+      return;
+    }
+
+    const list = document.createElement("ul");
+    list.className = "gcv-list";
+    findings.forEach((message) => {
+      const item = document.createElement("li");
+      item.textContent = message;
+      list.appendChild(item);
+    });
+    output.appendChild(list);
+  }
+
+  // ИСПРАВЛЕНО: try/catch — панель больше никогда не зависнет
+  async function waitForStableTable() {
+    let previousCount = 0;
+    let stablePolls = 0;
+    for (let attempt = 0; attempt < 14; attempt += 1) {
+      const count = readTable().length;
+      if (count > 0 && count === previousCount) stablePolls += 1;
+      else stablePolls = 0;
+      if (stablePolls >= 2) return;
+      previousCount = count;
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    }
+  }
+
+  async function runChecks() {
+    if (runInProgress) return;
+    runInProgress = true;
+    await waitForStableTable();
+    const rows = readTable();
+    if (rows.length < 1) {
+      renderPanel({ ...emptyResult(), findings: [`Таблица характеристик не найдена на странице: ${window.location.href}`] }, [], false);
+      runInProgress = false;
+      return;
+    }
+    const currentRun = ++runSequence;
+    hasRun = true;
+    const products = readProducts(rows);
+    const editPromise = Promise.all(products.map((p) => fetchEditBaseUrl(p).then((u) => { p.editBase = u; })));
+
+    const localResult = runLocalValidation(rows, products);
+    renderResults(localResult, products);
+    renderPanel(localResult, products, true);
+
+    try {
+      const officialResult = await runOfficialValidation(rows, products);
+      if (currentRun !== runSequence) return;
+      mergeResults(localResult, officialResult);
+    } catch (error) {
+      console.error("[GCV] Ошибка проверки:", error);
+      localResult.findings.push(`⚠️ Внутренняя ошибка проверки: ${error?.message || error}. Результаты по официальной части могут быть неполными.`);
+    }
+
+    if (currentRun !== runSequence) return;
+    await editPromise;
+    currentProductEditBase = products[0]?.editBase || "";
+    renderResults(localResult, products);
+    renderProductEditLinks(products);
+    if (pageMode() === "product") patchCardEditButton(localResult, rows);
+    renderPanel(localResult, products, false);
+    runInProgress = false;
+  }
+
+  function start() {
+    if (hasStarted) return;
+    hasStarted = true;
+    ensurePanel();
+    const observer = new MutationObserver(() => {
+      if (hasRun || runInProgress || document.querySelectorAll(ROW_SELECTOR).length < 1) return;
+      window.clearTimeout(autoTimer);
+      autoTimer = window.setTimeout(() => runChecks(), 1000);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    autoTimer = window.setTimeout(() => runChecks(), 1500);
+  }
+
+  if (isAdminPage()) {
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initAdminHighlight, { once: true });
+    else initAdminHighlight();
+  } else if (isOfficialProductPage()) {
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", focusOfficialField, { once: true });
+    else focusOfficialField();
+  } else if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start, { once: true });
+  } else {
+    start();
+    window.addEventListener("load", start, { once: true });
+  }
 })();
